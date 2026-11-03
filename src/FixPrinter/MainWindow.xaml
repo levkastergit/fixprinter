@@ -1,0 +1,119 @@
+<Window x:Class="FixPrinter.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="FixPrinter — лечим принтеры"
+        Width="720" Height="760" MinWidth="600" MinHeight="560"
+        WindowStartupLocation="CenterScreen"
+        Background="{StaticResource BgBrush}"
+        FontFamily="Segoe UI">
+    <Grid Margin="24,20,24,18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>   <!-- шапка -->
+            <RowDefinition Height="Auto"/>   <!-- кнопка -->
+            <RowDefinition Height="Auto"/>   <!-- итоговый статус -->
+            <RowDefinition Height="*"/>      <!-- результаты -->
+            <RowDefinition Height="Auto"/>   <!-- лог -->
+            <RowDefinition Height="Auto"/>   <!-- футер -->
+        </Grid.RowDefinitions>
+
+        <!-- Шапка -->
+        <StackPanel Grid.Row="0" Orientation="Horizontal" Margin="0,0,0,18">
+            <Border Width="52" Height="52" CornerRadius="14" VerticalAlignment="Center">
+                <Border.Background>
+                    <LinearGradientBrush StartPoint="0,0" EndPoint="1,1">
+                        <GradientStop Color="#38BDF8" Offset="0"/>
+                        <GradientStop Color="#6366F1" Offset="1"/>
+                    </LinearGradientBrush>
+                </Border.Background>
+                <TextBlock Text="🖨" FontSize="26" HorizontalAlignment="Center" VerticalAlignment="Center"/>
+            </Border>
+            <StackPanel Margin="14,0,0,0" VerticalAlignment="Center">
+                <TextBlock Text="FixPrinter" FontSize="26" FontWeight="Bold" Foreground="{StaticResource TextBrush}"/>
+                <TextBlock x:Name="SubtitleText" Text="Диагностика и автоматическая починка печати"
+                           FontSize="13" Foreground="{StaticResource MutedBrush}"/>
+            </StackPanel>
+        </StackPanel>
+
+        <!-- Главная кнопка -->
+        <StackPanel Grid.Row="1" Margin="0,0,0,14">
+            <Button x:Name="FixButton" Style="{StaticResource BigButton}"
+                    Content="🔧  Найти проблемы и починить" Click="FixButton_Click"
+                    HorizontalAlignment="Stretch"/>
+            <ProgressBar x:Name="Progress" Height="4" Margin="2,10,2,0" IsIndeterminate="True"
+                         Visibility="Collapsed" Foreground="{StaticResource AccentBrush}"
+                         Background="#1E293B" BorderThickness="0"/>
+        </StackPanel>
+
+        <!-- Итог -->
+        <Border x:Name="SummaryCard" Grid.Row="2" CornerRadius="12" Padding="16,12" Margin="0,0,0,14"
+                Background="{StaticResource CardBrush}" BorderBrush="{StaticResource CardBorderBrush}"
+                BorderThickness="1" Visibility="Collapsed">
+            <StackPanel>
+                <TextBlock x:Name="SummaryText" FontSize="15" FontWeight="SemiBold" TextWrapping="Wrap"
+                           Foreground="{StaticResource TextBrush}"/>
+                <TextBlock x:Name="SummaryHint" FontSize="12.5" Margin="0,4,0,0" TextWrapping="Wrap"
+                           Foreground="{StaticResource MutedBrush}"/>
+                <Button x:Name="SendLogsBigButton" Style="{StaticResource GhostButton}" Margin="0,10,0,2"
+                        HorizontalAlignment="Left" Click="SendLogs_Click"
+                        Visibility="Collapsed"
+                        Content="📤  Отправить логи на GitHub — разработчик посмотрит и выпустит исправление"/>
+            </StackPanel>
+        </Border>
+
+        <!-- Результаты проверок -->
+        <Border Grid.Row="3" CornerRadius="12" Background="{StaticResource CardBrush}"
+                BorderBrush="{StaticResource CardBorderBrush}" BorderThickness="1" Padding="6">
+            <ScrollViewer VerticalScrollBarVisibility="Auto">
+                <ItemsControl x:Name="ResultsList">
+                    <ItemsControl.ItemTemplate>
+                        <DataTemplate>
+                            <Border CornerRadius="8" Padding="12,9" Margin="6,3">
+                                <Border.Background>
+                                    <SolidColorBrush Color="#0F172A" Opacity="0.55"/>
+                                </Border.Background>
+                                <Grid>
+                                    <Grid.ColumnDefinitions>
+                                        <ColumnDefinition Width="30"/>
+                                        <ColumnDefinition Width="*"/>
+                                    </Grid.ColumnDefinitions>
+                                    <TextBlock Grid.Column="0" Text="{Binding Icon}" FontSize="15" VerticalAlignment="Top"/>
+                                    <StackPanel Grid.Column="1">
+                                        <TextBlock Text="{Binding Title}" FontSize="13.5" TextWrapping="Wrap"
+                                                   Foreground="{Binding TitleBrush}"/>
+                                        <TextBlock Text="{Binding Details}" FontSize="12" TextWrapping="Wrap"
+                                                   Foreground="#94A3B8"
+                                                   Visibility="{Binding DetailsVisibility}"/>
+                                    </StackPanel>
+                                </Grid>
+                            </Border>
+                        </DataTemplate>
+                    </ItemsControl.ItemTemplate>
+                </ItemsControl>
+            </ScrollViewer>
+        </Border>
+
+        <!-- Лог -->
+        <Expander Grid.Row="4" Margin="0,12,0,0" Foreground="{StaticResource MutedBrush}"
+                  Header="Журнал работы (лог)" FontSize="12.5">
+            <Border CornerRadius="10" Background="#0B1220" BorderBrush="{StaticResource CardBorderBrush}"
+                    BorderThickness="1" Margin="0,8,0,0">
+                <ScrollViewer x:Name="LogScroll" Height="150" VerticalScrollBarVisibility="Auto">
+                    <TextBox x:Name="LogBox" IsReadOnly="True" BorderThickness="0" Background="Transparent"
+                             Foreground="#7DD3FC" FontFamily="Consolas" FontSize="11.5" Padding="10"
+                             TextWrapping="Wrap"/>
+                </ScrollViewer>
+            </Border>
+        </Expander>
+
+        <!-- Футер -->
+        <Grid Grid.Row="5" Margin="0,14,0,0">
+            <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
+                <Button Style="{StaticResource GhostButton}" Content="📁 Папка логов" Click="OpenLogs_Click"/>
+                <Button Style="{StaticResource GhostButton}" Content="📤 Отправить логи" Margin="8,0,0,0"
+                        Click="SendLogs_Click"/>
+            </StackPanel>
+            <TextBlock x:Name="VersionText" HorizontalAlignment="Right" VerticalAlignment="Center"
+                       FontSize="11.5" Foreground="{StaticResource MutedBrush}"/>
+        </Grid>
+    </Grid>
+</Window>

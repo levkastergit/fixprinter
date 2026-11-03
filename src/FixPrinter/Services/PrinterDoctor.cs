@@ -1,0 +1,459 @@
+using System.Diagnostics;
+using System.IO;
+using System.Management;
+using System.Net.Sockets;
+using System.ServiceProcess;
+
+namespace FixPrinter.Services;
+
+public enum Severity { Ok, Warning, Error }
+
+public sealed class CheckResult
+{
+    public Severity Severity { get; init; }
+    public string Title { get; init; } = "";
+    public string Details { get; init; } = "";
+    /// <summary>Автоматическое исправление; null — чинится только вручную.</summary>
+    public Action? Fix { get; init; }
+    public bool IsProblem => Severity != Severity.Ok;
+}
+
+/// <summary>
+/// Диагностика и починка подсистемы печати Windows:
+/// служба печати, застрявшие задания, принтеры в «автономном режиме», сетевые порты.
+/// </summary>
+public sealed class PrinterDoctor
+{
+    private readonly Logger _log = Logger.Instance;
+
+    private static readonly string[] VirtualPrinters =
+    {
+        "Microsoft Print to PDF", "Microsoft XPS Document Writer",
+        "OneNote", "Fax", "AnyDesk Printer"
+    };
+
+    private static string SpoolDir =>
+        Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+            "System32", "spool", "PRINTERS");
+
+    // ---------- ДИАГНОСТИКА ----------
+
+    public List<CheckResult> Diagnose()
+    {
+        var results = new List<CheckResult>();
+        _log.Info("--- Диагностика ---");
+
+        CheckService(results, "RpcSs", "Служба удалённого вызова процедур (RPC)", critical: true);
+        CheckSpooler(results);
+        CheckSpoolFolder(results);
+        CheckPrinters(results);
+        CheckStuckJobs(results);
+        CheckNetworkPorts(results);
+
+        foreach (var r in results)
+            _log.Info($"[{r.Severity}] {r.Title}" + (r.Details.Length > 0 ? $" — {r.Details}" : ""));
+        return results;
+    }
+
+    private void CheckService(List<CheckResult> results, string name, string title, bool critical)
+    {
+        try
+        {
+            using var sc = new ServiceController(name);
+            if (sc.Status == ServiceControllerStatus.Running)
+                results.Add(new CheckResult { Severity = Severity.Ok, Title = $"{title}: работает" });
+            else
+                results.Add(new CheckResult
+                {
+                    Severity = critical ? Severity.Error : Severity.Warning,
+                    Title = $"{title}: не запущена (статус {sc.Status})",
+                    Details = "Без этой службы печать невозможна.",
+                    Fix = () => StartService(name)
+                });
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"Не удалось проверить службу {name}: {ex.Message}");
+            results.Add(new CheckResult { Severity = Severity.Error, Title = $"{title}: не найдена", Details = ex.Message });
+        }
+    }
+
+    private void CheckSpooler(List<CheckResult> results)
+    {
+        try
+        {
+            using var sc = new ServiceController("Spooler");
+            var startMode = GetServiceStartMode("Spooler");
+
+            if (startMode is "Disabled" or "Manual")
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Error,
+                    Title = $"Служба печати: автозапуск выключен ({startMode})",
+                    Details = "Служба должна запускаться автоматически.",
+                    Fix = () => SetServiceAutoStart("Spooler")
+                });
+
+            if (sc.Status != ServiceControllerStatus.Running)
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Error,
+                    Title = $"Служба печати (Spooler): не работает (статус {sc.Status})",
+                    Fix = RestartSpoolerAndClearQueue
+                });
+            else
+                results.Add(new CheckResult { Severity = Severity.Ok, Title = "Служба печати (Spooler): работает" });
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Не удалось проверить Spooler: " + ex.Message);
+            results.Add(new CheckResult { Severity = Severity.Error, Title = "Служба печати не найдена", Details = ex.Message });
+        }
+    }
+
+    private void CheckSpoolFolder(List<CheckResult> results)
+    {
+        try
+        {
+            if (!Directory.Exists(SpoolDir))
+            {
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Error,
+                    Title = "Папка очереди печати не существует",
+                    Details = SpoolDir,
+                    Fix = () => { Directory.CreateDirectory(SpoolDir); _log.Info("Папка очереди создана."); }
+                });
+                return;
+            }
+
+            var files = Directory.GetFiles(SpoolDir);
+            var old = files.Count(f => DateTime.Now - File.GetLastWriteTime(f) > TimeSpan.FromMinutes(15));
+            if (old > 0)
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Warning,
+                    Title = $"В очереди печати застряли файлы: {old} шт. старше 15 минут",
+                    Details = "Очередь будет очищена с перезапуском службы печати.",
+                    Fix = RestartSpoolerAndClearQueue
+                });
+            else
+                results.Add(new CheckResult { Severity = Severity.Ok, Title = "Папка очереди печати: чисто" });
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Проверка папки очереди: " + ex.Message);
+        }
+    }
+
+    private void CheckPrinters(List<CheckResult> results)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_Printer");
+            var printers = searcher.Get().Cast<ManagementObject>().ToList();
+
+            var real = printers.Where(p => !IsVirtual((string)p["Name"])).ToList();
+            _log.Info($"Найдено принтеров: {printers.Count} (из них реальных: {real.Count})");
+
+            if (real.Count == 0)
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Warning,
+                    Title = "Не найдено ни одного реального принтера",
+                    Details = "Установлены только виртуальные (PDF/XPS). Если принтер подключён — " +
+                              "проверьте кабель/сеть и установите драйвер с сайта производителя."
+                });
+
+            if (!printers.Any(p => (bool)(p["Default"] ?? false)))
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Warning,
+                    Title = "Не назначен принтер по умолчанию",
+                    Details = "Параметры → Bluetooth и устройства → Принтеры и сканеры."
+                });
+
+            foreach (var p in printers)
+            {
+                var name = (string)p["Name"];
+                var offline = (bool)(p["WorkOffline"] ?? false);
+                var status = Convert.ToInt32(p["PrinterStatus"] ?? 0);
+                var errState = Convert.ToInt32(p["DetectedErrorState"] ?? 0);
+
+                if (offline && !IsVirtual(name))
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"«{name}»: включён автономный режим (offline)",
+                        Details = "Windows не отправляет задания на этот принтер.",
+                        Fix = () => SetPrinterOnline(name)
+                    });
+                }
+                else if (errState is 8 or 7 or 4 or 6) // замятие, открыта крышка, нет бумаги, нет тонера
+                {
+                    var reason = errState switch
+                    {
+                        4 => "нет бумаги", 6 => "закончился тонер/чернила",
+                        7 => "открыта крышка", 8 => "замятие бумаги", _ => "ошибка"
+                    };
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"«{name}»: {reason}",
+                        Details = "Это аппаратная проблема — устраните её на самом принтере."
+                    });
+                }
+                else if (status == 7 && !IsVirtual(name))
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Warning,
+                        Title = $"«{name}»: принтер сообщает статус Offline",
+                        Details = "Проверьте питание и подключение. Попробую перевести в онлайн.",
+                        Fix = () => SetPrinterOnline(name)
+                    });
+                }
+                else
+                {
+                    results.Add(new CheckResult { Severity = Severity.Ok, Title = $"«{name}»: в порядке" });
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Проверка принтеров: " + ex);
+            results.Add(new CheckResult { Severity = Severity.Error, Title = "Не удалось опросить принтеры (WMI)", Details = ex.Message });
+        }
+    }
+
+    private void CheckStuckJobs(List<CheckResult> results)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PrintJob");
+            var now = DateTime.Now;
+            var stuckByPrinter = new Dictionary<string, int>();
+
+            foreach (var job in searcher.Get().Cast<ManagementObject>())
+            {
+                var fullName = (string)(job["Name"] ?? "");          // "Принтер, 123"
+                var printer = fullName.Split(',')[0].Trim();
+                var status = (string)(job["JobStatus"] ?? "");
+                DateTime submitted;
+                try { submitted = ManagementDateTimeConverter.ToDateTime((string)job["TimeSubmitted"]); }
+                catch { submitted = now; }
+
+                var age = now - submitted;
+                _log.Info($"Задание печати: «{fullName}», статус: «{status}», возраст: {age:hh\\:mm\\:ss}");
+
+                if (age > TimeSpan.FromMinutes(10) ||
+                    status.Contains("Error", StringComparison.OrdinalIgnoreCase))
+                {
+                    stuckByPrinter[printer] = stuckByPrinter.GetValueOrDefault(printer) + 1;
+                }
+            }
+
+            foreach (var (printer, count) in stuckByPrinter)
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Error,
+                    Title = $"«{printer}»: застрявшие задания печати — {count} шт.",
+                    Details = "Очередь будет очищена.",
+                    Fix = () => { CancelAllJobs(printer); RestartSpoolerAndClearQueue(); }
+                });
+
+            if (stuckByPrinter.Count == 0)
+                results.Add(new CheckResult { Severity = Severity.Ok, Title = "Застрявших заданий печати нет" });
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Проверка заданий печати: " + ex.Message);
+        }
+    }
+
+    private void CheckNetworkPorts(List<CheckResult> results)
+    {
+        try
+        {
+            using var printers = new ManagementObjectSearcher("SELECT Name, PortName FROM Win32_Printer");
+            var usedPorts = printers.Get().Cast<ManagementObject>()
+                .Where(p => !IsVirtual((string)p["Name"]))
+                .Select(p => (Printer: (string)p["Name"], Port: (string)(p["PortName"] ?? "")))
+                .ToList();
+
+            using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_TCPIPPrinterPort");
+            foreach (var port in searcher.Get().Cast<ManagementObject>())
+            {
+                var portName = (string)(port["Name"] ?? "");
+                var owner = usedPorts.FirstOrDefault(u => u.Port == portName);
+                if (owner.Printer is null) continue; // порт никем не используется
+
+                var host = (string)(port["HostAddress"] ?? "");
+                var tcpPort = Convert.ToInt32(port["PortNumber"] ?? 9100);
+                _log.Info($"Проверка сетевого принтера «{owner.Printer}»: {host}:{tcpPort}…");
+
+                if (TcpReachable(host, tcpPort, 1500))
+                    results.Add(new CheckResult { Severity = Severity.Ok, Title = $"Сетевой принтер «{owner.Printer}» ({host}) доступен" });
+                else
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"Сетевой принтер «{owner.Printer}» недоступен по сети ({host}:{tcpPort})",
+                        Details = "Проверьте: принтер включён, подключён к той же сети (Wi-Fi/кабель), " +
+                                  "IP-адрес не поменялся. Если у принтера сменился IP — переустановите порт."
+                    });
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Error("Проверка сетевых портов: " + ex.Message);
+        }
+    }
+
+    private static bool TcpReachable(string host, int port, int timeoutMs)
+    {
+        try
+        {
+            using var client = new TcpClient();
+            return client.ConnectAsync(host, port).Wait(timeoutMs) && client.Connected;
+        }
+        catch { return false; }
+    }
+
+    private static bool IsVirtual(string name) =>
+        VirtualPrinters.Any(v => name.Contains(v, StringComparison.OrdinalIgnoreCase));
+
+    // ---------- ПОЧИНКА ----------
+
+    /// <summary>Выполняет исправления. Возвращает число применённых фиксов.</summary>
+    public int Fix(List<CheckResult> issues)
+    {
+        _log.Info("--- Починка ---");
+        var fixes = issues.Where(i => i.IsProblem && i.Fix != null).ToList();
+        var done = 0;
+        var spoolerRestarted = false;
+
+        foreach (var issue in fixes)
+        {
+            // Не перезапускаем спулер несколько раз подряд
+            if (issue.Fix == (Action)RestartSpoolerAndClearQueue && spoolerRestarted) continue;
+            try
+            {
+                _log.Info($"Исправляю: {issue.Title}");
+                issue.Fix!();
+                if (issue.Fix == (Action)RestartSpoolerAndClearQueue) spoolerRestarted = true;
+                done++;
+            }
+            catch (Exception ex)
+            {
+                _log.Error($"Не удалось исправить «{issue.Title}»: {ex}");
+            }
+        }
+        _log.Info($"Применено исправлений: {done} из {fixes.Count}");
+        return done;
+    }
+
+    private void StartService(string name)
+    {
+        using var sc = new ServiceController(name);
+        if (sc.Status == ServiceControllerStatus.Running) return;
+        _log.Info($"Запускаю службу {name}…");
+        sc.Start();
+        sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+        _log.Info($"Служба {name} запущена.");
+    }
+
+    public void RestartSpoolerAndClearQueue()
+    {
+        _log.Info("Перезапуск службы печати с очисткой очереди…");
+        using var sc = new ServiceController("Spooler");
+
+        if (sc.Status != ServiceControllerStatus.Stopped)
+        {
+            try
+            {
+                sc.Stop();
+                sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromSeconds(30));
+            }
+            catch (Exception ex)
+            {
+                _log.Warn("Служба не остановилась штатно: " + ex.Message + ". Завершаю процесс spoolsv.exe…");
+                foreach (var proc in Process.GetProcessesByName("spoolsv"))
+                {
+                    try { proc.Kill(); proc.WaitForExit(5000); } catch { }
+                }
+            }
+        }
+        _log.Info("Служба печати остановлена.");
+
+        // Очистка очереди
+        var deleted = 0;
+        if (Directory.Exists(SpoolDir))
+        {
+            foreach (var file in Directory.GetFiles(SpoolDir))
+            {
+                try { File.Delete(file); deleted++; }
+                catch (Exception ex) { _log.Warn($"Не удалось удалить {Path.GetFileName(file)}: {ex.Message}"); }
+            }
+        }
+        _log.Info($"Удалено файлов из очереди: {deleted}.");
+
+        sc.Refresh();
+        if (sc.Status != ServiceControllerStatus.Running)
+        {
+            sc.Start();
+            sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
+        }
+        _log.Info("Служба печати запущена заново.");
+    }
+
+    private void SetPrinterOnline(string printerName)
+    {
+        _log.Info($"Перевожу «{printerName}» в онлайн…");
+        using var searcher = new ManagementObjectSearcher(
+            $"SELECT * FROM Win32_Printer WHERE Name = '{printerName.Replace("'", "''")}'");
+        foreach (var printer in searcher.Get().Cast<ManagementObject>())
+        {
+            printer["WorkOffline"] = false;
+            printer.Put();
+            _log.Info($"«{printerName}»: автономный режим выключен.");
+        }
+    }
+
+    private void CancelAllJobs(string printerName)
+    {
+        _log.Info($"Отменяю все задания на «{printerName}»…");
+        using var searcher = new ManagementObjectSearcher(
+            $"SELECT * FROM Win32_Printer WHERE Name = '{printerName.Replace("'", "''")}'");
+        foreach (var printer in searcher.Get().Cast<ManagementObject>())
+        {
+            var result = printer.InvokeMethod("CancelAllJobs", null);
+            _log.Info($"CancelAllJobs(«{printerName}») → код {result}");
+        }
+    }
+
+    private static string GetServiceStartMode(string name)
+    {
+        using var searcher = new ManagementObjectSearcher(
+            $"SELECT StartMode FROM Win32_Service WHERE Name = '{name}'");
+        foreach (var svc in searcher.Get().Cast<ManagementObject>())
+            return (string)(svc["StartMode"] ?? "Unknown");
+        return "Unknown";
+    }
+
+    private void SetServiceAutoStart(string name)
+    {
+        _log.Info($"Ставлю службе {name} автозапуск…");
+        using var searcher = new ManagementObjectSearcher(
+            $"SELECT * FROM Win32_Service WHERE Name = '{name}'");
+        foreach (var svc in searcher.Get().Cast<ManagementObject>())
+        {
+            var inParams = svc.GetMethodParameters("ChangeStartMode");
+            inParams["StartMode"] = "Automatic";
+            var outParams = svc.InvokeMethod("ChangeStartMode", inParams, null);
+            _log.Info($"ChangeStartMode({name}, Automatic) → код {outParams["ReturnValue"]}");
+        }
+        StartService(name);
+    }
+}
