@@ -2,7 +2,10 @@ using System.Diagnostics;
 using System.IO;
 using System.Management;
 using System.Net.Sockets;
+using System.Printing;
 using System.ServiceProcess;
+using System.Text.RegularExpressions;
+using Microsoft.Win32;
 
 namespace FixPrinter.Services;
 
@@ -29,7 +32,14 @@ public sealed class PrinterDoctor
     private static readonly string[] VirtualPrinters =
     {
         "Microsoft Print to PDF", "Microsoft XPS Document Writer",
-        "OneNote", "Fax", "AnyDesk Printer"
+        "OneNote", "Fax", "AnyDesk Printer", "Adobe PDF", "Generic / Text Only"
+    };
+
+    /// <summary>Семейства аппаратов формата A3 — если драйвер такого принтера не отдаёт A3, драйвер неправильный.</summary>
+    private static readonly string[] A3ClassModels =
+    {
+        "TASKalfa", "bizhub", "imageRUNNER", "WorkCentre", "AltaLink",
+        "e-STUDIO", "ECOSYS M8", "ECOSYS M4", "Versant", "Aficio MP"
     };
 
     private static string SpoolDir =>
@@ -46,7 +56,10 @@ public sealed class PrinterDoctor
         CheckService(results, "RpcSs", "Служба удалённого вызова процедур (RPC)", critical: true);
         CheckSpooler(results);
         CheckSpoolFolder(results);
+        CheckWindowsManagesDefault(results);
         CheckPrinters(results);
+        CheckDuplicateQueues(results);
+        CheckPaperSizesAndDefault(results);
         CheckStuckJobs(results);
         CheckNetworkPorts(results);
 
@@ -179,6 +192,23 @@ public sealed class PrinterDoctor
                 var offline = (bool)(p["WorkOffline"] ?? false);
                 var status = Convert.ToInt32(p["PrinterStatus"] ?? 0);
                 var errState = Convert.ToInt32(p["DetectedErrorState"] ?? 0);
+                var driver = (string)(p["DriverName"] ?? "?");
+                var port = (string)(p["PortName"] ?? "?");
+                var isDefault = (bool)(p["Default"] ?? false);
+
+                _log.Info($"Принтер «{name}»: драйвер «{driver}», порт «{port}», " +
+                          $"по умолчанию: {(isDefault ? "ДА" : "нет")}, offline: {offline}, " +
+                          $"статус: {status}, ошибка: {errState}");
+
+                if (!IsVirtual(name) && port.StartsWith("WSD", StringComparison.OrdinalIgnoreCase))
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Warning,
+                        Title = $"«{name}» подключён через WSD-порт",
+                        Details = "Когда такой принтер выключен или «уснул», диалоги печати в Chrome, " +
+                                  "Acrobat и других программах подолгу зависают. Включите принтер. " +
+                                  "Надёжное решение — переустановить принтер через порт TCP/IP (по IP-адресу)."
+                    });
 
                 if (offline && !IsVirtual(name))
                 {
@@ -224,6 +254,239 @@ public sealed class PrinterDoctor
         {
             _log.Error("Проверка принтеров: " + ex);
             results.Add(new CheckResult { Severity = Severity.Error, Title = "Не удалось опросить принтеры (WMI)", Details = ex.Message });
+        }
+    }
+
+    private sealed record PrinterRow(string Name, string Driver, string Port, bool Default);
+
+    private List<PrinterRow> ListPrinterRows()
+    {
+        using var searcher = new ManagementObjectSearcher(
+            "SELECT Name, DriverName, PortName, Default FROM Win32_Printer");
+        return searcher.Get().Cast<ManagementObject>()
+            .Select(p => new PrinterRow(
+                (string)p["Name"],
+                (string)(p["DriverName"] ?? "?"),
+                (string)(p["PortName"] ?? "?"),
+                (bool)(p["Default"] ?? false)))
+            .ToList();
+    }
+
+    /// <summary>Windows 10/11 по умолчанию сама переключает принтер «по умолчанию» на последний использованный —
+    /// из-за этого печать внезапно уходит не туда. Отключаем это поведение.</summary>
+    private void CheckWindowsManagesDefault(List<CheckResult> results)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows NT\CurrentVersion\Windows");
+            var mode = key?.GetValue("LegacyDefaultPrinterMode") as int?;
+            if (mode == 1)
+            {
+                results.Add(new CheckResult { Severity = Severity.Ok, Title = "Windows не переключает принтер по умолчанию сама" });
+                return;
+            }
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Warning,
+                Title = "Windows сама переключает принтер по умолчанию",
+                Details = "Включено «Разрешить Windows управлять принтером по умолчанию»: печать может " +
+                          "внезапно уходить на другой (в т.ч. виртуальный) принтер. Отключу это.",
+                Fix = () =>
+                {
+                    using var wk = Registry.CurrentUser.CreateSubKey(
+                        @"Software\Microsoft\Windows NT\CurrentVersion\Windows");
+                    wk.SetValue("LegacyDefaultPrinterMode", 1, RegistryValueKind.DWord);
+                    _log.Info("LegacyDefaultPrinterMode = 1: автопереключение принтера по умолчанию отключено.");
+                }
+            });
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Проверка LegacyDefaultPrinterMode: " + ex.Message);
+        }
+    }
+
+    /// <summary>Очереди «(копия 1)» — следы переустановки драйвера. Если оригинал жив — копию можно удалить.</summary>
+    private void CheckDuplicateQueues(List<CheckResult> results)
+    {
+        try
+        {
+            var printers = ListPrinterRows();
+            var rx = new Regex(@"^(?<base>.+?)\s*\((копия|copy)\s*\d+\)\s*$", RegexOptions.IgnoreCase);
+            foreach (var p in printers)
+            {
+                var m = rx.Match(p.Name);
+                if (!m.Success) continue;
+                var baseName = m.Groups["base"].Value.Trim();
+                var original = printers.FirstOrDefault(o =>
+                    o.Name.Equals(baseName, StringComparison.OrdinalIgnoreCase));
+
+                if (original != null)
+                {
+                    var copyName = p.Name;
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Warning,
+                        Title = $"Дубликат очереди печати: «{copyName}»",
+                        Details = $"Есть и оригинал «{baseName}», и копия — программы путаются, " +
+                                  "какая очередь рабочая. Удалю копию.",
+                        Fix = () => DeletePrinterQueue(copyName)
+                    });
+                }
+                else
+                {
+                    _log.Info($"Очередь «{p.Name}» названа «копия», но оригинала нет — работе не мешает.");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Проверка дубликатов очередей: " + ex.Message);
+        }
+    }
+
+    /// <summary>Опрашивает у драйверов поддерживаемые форматы бумаги (это же выявляет зависшие драйверы —
+    /// главную причину тормозов диалога печати) и проверяет принтер по умолчанию.</summary>
+    private void CheckPaperSizesAndDefault(List<CheckResult> results)
+    {
+        List<PrinterRow> printers;
+        try { printers = ListPrinterRows(); }
+        catch (Exception ex) { _log.Error("Список принтеров: " + ex.Message); return; }
+
+        var real = printers.Where(p => !IsVirtual(p.Name)).ToList();
+        var a3Capable = new List<string>();
+
+        foreach (var p in real)
+        {
+            var sizes = new List<string>();
+            var sw = Stopwatch.StartNew();
+            try
+            {
+                var queueName = p.Name;
+                var task = Task.Run(() =>
+                {
+                    using var server = new LocalPrintServer();
+                    using var q = new PrintQueue(server, queueName);
+                    var caps = q.GetPrintCapabilities();
+                    return caps.PageMediaSizeCapability
+                        .Where(s => s.PageMediaSizeName.HasValue)
+                        .Select(s => s.PageMediaSizeName!.Value.ToString())
+                        .ToList();
+                });
+
+                if (!task.Wait(TimeSpan.FromSeconds(12)))
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"Драйвер принтера «{p.Name}» не отвечает (ждал 12 секунд)",
+                        Details = "Именно такие зависания драйвера заставляют тормозить диалоги печати " +
+                                  "в Chrome и Acrobat. Переустановите драйвер этого принтера " +
+                                  "(или удалите принтер, если он больше не нужен)."
+                    });
+                    continue;
+                }
+                sizes = task.Result;
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Не удалось получить форматы бумаги «{p.Name}»: {ex.InnerException?.Message ?? ex.Message}");
+                continue;
+            }
+
+            _log.Info($"«{p.Name}»: драйвер ответил за {sw.ElapsedMilliseconds} мс, " +
+                      $"форматов бумаги: {sizes.Count} — {string.Join(", ", sizes)}");
+            if (sw.ElapsedMilliseconds > 5000)
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Warning,
+                    Title = $"Драйвер «{p.Name}» отвечает очень медленно ({sw.ElapsedMilliseconds / 1000.0:F1} с)",
+                    Details = "Это замедляет открытие диалога печати в любых программах."
+                });
+
+            var hasA3 = sizes.Contains("ISOA3");
+            if (hasA3)
+            {
+                a3Capable.Add(p.Name);
+            }
+            else if (A3ClassModels.Any(m2 => p.Name.Contains(m2, StringComparison.OrdinalIgnoreCase) ||
+                                             p.Driver.Contains(m2, StringComparison.OrdinalIgnoreCase)))
+            {
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Error,
+                    Title = $"«{p.Name}» — аппарат формата A3, но его драйвер не предлагает A3",
+                    Details = "Поэтому формата A3 нет в Chrome/Acrobat. Установлен урезанный или неверный " +
+                              "драйвер — скачайте полный драйвер именно вашей модели с сайта производителя " +
+                              "и переустановите принтер."
+                });
+            }
+        }
+
+        if (a3Capable.Count > 0)
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Ok,
+                Title = "Печать A3 доступна на: " + string.Join(", ", a3Capable.Select(n => $"«{n}»"))
+            });
+        else if (real.Count > 0)
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Warning,
+                Title = "Ни один установленный драйвер не предлагает формат A3",
+                Details = "Если принтер физически умеет A3 — переустановите его полный драйвер. " +
+                          "Если все принтеры формата A4 — A3 на них не напечатать."
+            });
+
+        // Принтер по умолчанию
+        var def = printers.FirstOrDefault(p => p.Default);
+        _log.Info("Принтер по умолчанию: " + (def == null ? "НЕ НАЗНАЧЕН" : $"«{def.Name}»"));
+        if (def != null && IsVirtual(def.Name) && real.Count > 0)
+        {
+            var candidate = a3Capable.FirstOrDefault() ?? real[0].Name;
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Warning,
+                Title = $"Принтер по умолчанию — виртуальный: «{def.Name}»",
+                Details = $"Программы при печати целятся в него, а не в настоящий принтер. " +
+                          $"Сделаю принтером по умолчанию «{candidate}».",
+                Fix = () => SetDefaultPrinter(candidate)
+            });
+        }
+        else if (def != null && a3Capable.Count > 0 && !a3Capable.Contains(def.Name))
+        {
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Warning,
+                Title = $"Принтер по умолчанию «{def.Name}» не умеет A3",
+                Details = "Для печати A3 выбирайте в диалоге печати: " +
+                          string.Join(", ", a3Capable.Select(n => $"«{n}»"))
+            });
+        }
+    }
+
+    private void DeletePrinterQueue(string printerName)
+    {
+        _log.Info($"Удаляю очередь печати «{printerName}»…");
+        using var searcher = new ManagementObjectSearcher(
+            $"SELECT * FROM Win32_Printer WHERE Name = '{printerName.Replace("'", "''")}'");
+        foreach (var printer in searcher.Get().Cast<ManagementObject>())
+        {
+            printer.Delete();
+            _log.Info($"Очередь «{printerName}» удалена.");
+        }
+    }
+
+    private void SetDefaultPrinter(string printerName)
+    {
+        _log.Info($"Назначаю «{printerName}» принтером по умолчанию…");
+        using var searcher = new ManagementObjectSearcher(
+            $"SELECT * FROM Win32_Printer WHERE Name = '{printerName.Replace("'", "''")}'");
+        foreach (var printer in searcher.Get().Cast<ManagementObject>())
+        {
+            var result = printer.InvokeMethod("SetDefaultPrinter", null);
+            _log.Info($"SetDefaultPrinter(«{printerName}») → код {result}");
         }
     }
 
