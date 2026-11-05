@@ -27,10 +27,10 @@ public static class GitHubReporter
             $"- ОС: {Environment.OSVersion.VersionString}\n" +
             $"- Компьютер: {Environment.MachineName}\n\n" +
             "## Лог\n\n" +
-            "Полный лог уже скопирован в буфер обмена — поставьте курсор на строку ниже и нажмите **Ctrl+V**. " +
-            "Либо перетащите в это поле файл лога:\n" +
-            $"`{log.LogFilePath}`\n\n" +
-            "```\n(вставьте лог сюда)\n```";
+            "⚠️ **ВАЖНО: без этого шага отчёт бесполезен.** Лог уже в буфере обмена — " +
+            "кликните мышкой в КОНЕЦ этого текста и нажмите **Ctrl+V**, затем кнопку Create.\n" +
+            $"(запасной вариант: перетащите сюда файл `{log.LogFilePath}`)\n\n" +
+            "⬇️⬇️⬇️ ВСТАВЬТЕ ЛОГ НИЖЕ (Ctrl+V) ⬇️⬇️⬇️\n\n";
 
         var url = $"https://github.com/{Repo}/issues/new" +
                   $"?title={WebUtility.UrlEncode(title)}" +

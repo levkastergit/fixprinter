@@ -776,9 +776,9 @@ public sealed class PrinterDoctor
                 }
 
                 var target = guiltyQueues.Count > 0 ? guiltyQueues : AllRealQueues();
-                var appliedAt = GetRawOnlyAppliedTime(target);
+                var treatment = GetTreatment(target);
 
-                if (appliedAt == null)
+                if (treatment == null)
                 {
                     results.Add(new CheckResult
                     {
@@ -786,8 +786,8 @@ public sealed class PrinterDoctor
                         Title = $"Падения при печати из-за драйвера принтера ({last.Module}): {apps}",
                         Details = "Виновник: " + string.Join(", ", target.Select(q => $"«{q}»")) +
                                   ". Отключу у него «расширенные функции печати» (печать в RAW) и перезапущу " +
-                                  "службу печати — это типовое лечение таких падений. " + DriverDownloadHint(target) +
-                                  " Обходной путь: в Chrome печатайте через системный диалог (Ctrl+Shift+P).",
+                                  "службу печати. Обходной путь: в Chrome печатайте через системный " +
+                                  "диалог (Ctrl+Shift+P).",
                         Fix = () =>
                         {
                             foreach (var q in target) SetRawOnly(q, true);
@@ -797,26 +797,61 @@ public sealed class PrinterDoctor
                     continue;
                 }
 
-                var after = moduleGroup.Count(c => c.Time > appliedAt.Value.AddMinutes(2));
+                var after = moduleGroup.Count(c => c.Time > treatment.AppliedAt.AddMinutes(2));
                 if (after == 0)
                 {
                     results.Add(new CheckResult
                     {
                         Severity = Severity.Ok,
-                        Title = $"Падения из-за {last.Module} были до лечения ({appliedAt:dd.MM HH:mm}) — новых нет",
-                        Details = "Лечение (отключение расширенных функций печати) уже применено. " +
-                                  "Проверьте печать; если браузер снова закроется — запустите проверку ещё раз."
+                        Title = $"Падения из-за {last.Module} были до лечения ({treatment.AppliedAt:dd.MM HH:mm}) — новых нет",
+                        Details = "Проверьте печать; если браузер снова закроется — запустите проверку ещё раз."
+                    });
+                }
+                else if (treatment.Stage == 1)
+                {
+                    // RawOnly не помог: крэш происходит при загрузке конфигурационной DLL драйвера
+                    // в процессе браузера. Этап 2: сброс повреждённого DEVMODE + пересоздание очереди.
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"Браузер падает из-за драйвера ({last.Module}) даже после первого лечения ({after} раз)",
+                        Details = "Применю лечение, этап 2: сброшу сохранённые настройки печати (повреждённый " +
+                                  "DEVMODE в реестре — типовая причина таких падений; сделаю резервную копию) и " +
+                                  "пересоздам очередь печати начисто. " +
+                                  "До проверки печатайте через системный диалог (Ctrl+Shift+P).",
+                        Fix = () =>
+                        {
+                            foreach (var q in target)
+                            {
+                                ClearPerUserDevMode(q);
+                                var newName = RecreateQueueClean(q);
+                                MarkTreatment(newName ?? q, 2);
+                                if (newName != null) MarkTreatment(q, 2);
+                            }
+                            RestartSpoolerAndClearQueue();
+                        }
                     });
                 }
                 else
                 {
+                    var hint = DriverDownloadHint(target);
                     results.Add(new CheckResult
                     {
                         Severity = Severity.Error,
-                        Title = $"Браузер падает из-за драйвера ({last.Module}) даже после лечения ({after} раз)",
-                        Details = "Автоматические меры исчерпаны — нужен свежий драйвер. " +
-                                  DriverDownloadHint(target) +
-                                  " До переустановки печатайте через системный диалог (Ctrl+Shift+P)."
+                        Title = $"Браузер падает из-за драйвера ({last.Module}) после двух этапов лечения",
+                        Details = "Автоматические меры исчерпаны: драйвер повреждён или несовместим — нужна " +
+                                  "чистая переустановка. Открою страницу загрузки. Порядок: 1) скачайте драйвер; " +
+                                  "2) в FixPrinter нажмите «Удалить принтеры…» и удалите этот принтер вместе с " +
+                                  "драйвером; 3) установите скачанный драйвер и добавьте принтер заново. " + hint,
+                        Fix = () =>
+                        {
+                            var url = Regex.Match(hint, @"https?://\S+").Value;
+                            if (url.Length > 0)
+                            {
+                                _log.Info("Открываю страницу загрузки драйвера: " + url);
+                                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+                            }
+                        }
                     });
                 }
             }
@@ -907,39 +942,145 @@ public sealed class PrinterDoctor
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "FixPrinter", "state.json");
 
-    private Dictionary<string, DateTime> LoadRawOnlyState()
+    /// <summary>Этапы лечения падений из-за драйвера: 1 — RawOnly, 2 — сброс DEVMODE + пересоздание очереди.</summary>
+    public sealed record Treatment(int Stage, DateTime AppliedAt);
+
+    private Dictionary<string, Treatment> LoadTreatments()
     {
         try
         {
             if (File.Exists(StateFilePath))
-                return JsonSerializer.Deserialize<Dictionary<string, DateTime>>(
-                           File.ReadAllText(StateFilePath)) ?? new();
+            {
+                var text = File.ReadAllText(StateFilePath);
+                try
+                {
+                    var t = JsonSerializer.Deserialize<Dictionary<string, Treatment>>(text);
+                    if (t != null) return t;
+                }
+                catch { /* старый формат */ }
+                var old = JsonSerializer.Deserialize<Dictionary<string, DateTime>>(text);
+                if (old != null)
+                    return old.ToDictionary(kv => kv.Key, kv => new Treatment(1, kv.Value));
+            }
         }
         catch (Exception ex) { _log.Warn("Чтение state.json: " + ex.Message); }
-        return new Dictionary<string, DateTime>();
+        return new Dictionary<string, Treatment>();
     }
 
-    private void MarkRawOnlyApplied(string printerName)
+    private void MarkTreatment(string printerName, int stage)
     {
         try
         {
-            var state = LoadRawOnlyState();
-            state[printerName] = DateTime.Now;
+            var state = LoadTreatments();
+            state[printerName] = new Treatment(stage, DateTime.Now);
             Directory.CreateDirectory(Path.GetDirectoryName(StateFilePath)!);
             File.WriteAllText(StateFilePath, JsonSerializer.Serialize(state));
+            _log.Info($"Отмечено лечение: «{printerName}», этап {stage}.");
         }
         catch (Exception ex) { _log.Warn("Запись state.json: " + ex.Message); }
     }
 
-    /// <summary>Когда для этих очередей последний раз применяли RawOnly (null — не применяли).</summary>
-    private DateTime? GetRawOnlyAppliedTime(IEnumerable<string> queueNames)
+    /// <summary>Последнее применённое лечение для этих очередей (null — не применяли).</summary>
+    private Treatment? GetTreatment(IEnumerable<string> queueNames)
     {
-        var state = LoadRawOnlyState();
-        DateTime? best = null;
+        var state = LoadTreatments();
+        Treatment? best = null;
         foreach (var name in queueNames)
-            if (state.TryGetValue(name, out var t) && (best == null || t > best))
+            if (state.TryGetValue(name, out var t) && (best == null || t.AppliedAt > best.AppliedAt))
                 best = t;
         return best;
+    }
+
+    /// <summary>Сбрасывает пользовательские настройки печати (DEVMODE) принтера в реестре —
+    /// повреждённый DEVMODE — типовая причина падений конфигурационной DLL драйвера
+    /// внутри Chrome/Edge/Acrobat. Значения сохраняются в резервную копию.</summary>
+    private void ClearPerUserDevMode(string printerName)
+    {
+        var backupDir = Path.Combine(Path.GetDirectoryName(StateFilePath)!, "devmode-backup");
+        Directory.CreateDirectory(backupDir);
+
+        foreach (var subKey in new[] { @"Printers\DevModePerUser", @"Printers\DevModes2" })
+        {
+            try
+            {
+                using var key = Registry.CurrentUser.OpenSubKey(subKey, writable: true);
+                if (key == null) continue;
+                foreach (var valueName in key.GetValueNames())
+                {
+                    if (!valueName.Equals(printerName, StringComparison.OrdinalIgnoreCase) &&
+                        !valueName.StartsWith(printerName + ",", StringComparison.OrdinalIgnoreCase))
+                        continue;
+
+                    if (key.GetValue(valueName) is byte[] bytes)
+                    {
+                        var safe = Regex.Replace(valueName, @"[^\w\-]+", "_");
+                        File.WriteAllBytes(Path.Combine(backupDir,
+                            $"{safe}_{DateTime.Now:yyyyMMdd_HHmmss}.bin"), bytes);
+                    }
+                    key.DeleteValue(valueName);
+                    _log.Info($"Сброшен сохранённый DEVMODE: {subKey}\\{valueName} (резервная копия в {backupDir}).");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Сброс DEVMODE в {subKey}: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>Пересоздаёт очередь с чистым именем (без «копия N») на том же драйвере и порту.
+    /// Старая очередь удаляется только после успешного создания новой. Возвращает новое имя или null.</summary>
+    private string? RecreateQueueClean(string oldName)
+    {
+        try
+        {
+            var rows = ListPrinterRows();
+            var row = rows.FirstOrDefault(r => r.Name.Equals(oldName, StringComparison.OrdinalIgnoreCase));
+            if (row == null) return null;
+
+            var clean = Regex.Replace(oldName, @"\s*\((копия|copy)\s*\d+\)\s*$", "",
+                RegexOptions.IgnoreCase).Trim();
+            if (clean.Length == 0 || clean.Equals(oldName, StringComparison.OrdinalIgnoreCase) ||
+                rows.Any(r => r.Name.Equals(clean, StringComparison.OrdinalIgnoreCase)))
+                return null; // пересоздавать не во что — ограничиваемся сбросом DEVMODE
+
+            _log.Info($"Пересоздаю очередь: «{oldName}» → «{clean}» (драйвер «{row.Driver}», порт «{row.Port}»)…");
+            try
+            {
+                using var cls = new ManagementClass("Win32_Printer");
+                using var np = cls.CreateInstance();
+                np["DeviceID"] = clean;
+                np["DriverName"] = row.Driver;
+                np["PortName"] = row.Port;
+                np.Put();
+            }
+            catch (Exception wmiEx)
+            {
+                _log.Warn("WMI-создание очереди не удалось: " + wmiEx.Message + ". Пробую Add-Printer…");
+                var psi = new ProcessStartInfo("powershell.exe",
+                    $"-NoProfile -NonInteractive -Command \"Add-Printer -Name '{clean.Replace("'", "''")}' " +
+                    $"-DriverName '{row.Driver.Replace("'", "''")}' -PortName '{row.Port.Replace("'", "''")}'\"")
+                { UseShellExecute = false, CreateNoWindow = true };
+                using var proc = Process.Start(psi);
+                proc!.WaitForExit(30000);
+            }
+
+            if (!ListPrinterRows().Any(r => r.Name.Equals(clean, StringComparison.OrdinalIgnoreCase)))
+            {
+                _log.Error($"Новая очередь «{clean}» не появилась — старую не трогаю.");
+                return null;
+            }
+
+            if (row.Default) SetDefaultPrinter(clean);
+            DeletePrinterQueue(oldName);
+            _log.Info($"Очередь пересоздана начисто: «{clean}».");
+            return clean;
+        }
+        catch (Exception ex)
+        {
+            _log.Error($"Пересоздание очереди «{oldName}»: {ex.Message}");
+            return null;
+        }
     }
 
     /// <summary>Версии файлов драйверов реальных принтеров — чтобы понимать, что именно установлено.</summary>
@@ -1028,7 +1169,7 @@ public sealed class PrinterDoctor
             printer.Put();
             _log.Info($"«{printerName}»: RawOnly применён.");
         }
-        if (on) MarkRawOnlyApplied(printerName);
+        if (on) MarkTreatment(printerName, 1);
     }
 
     private static string? ReadLastPrinterFromPrefs(string prefsPath)
