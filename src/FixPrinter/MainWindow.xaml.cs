@@ -119,6 +119,11 @@ public partial class MainWindow : Window
 
     private void OpenLogs_Click(object sender, RoutedEventArgs e) => GitHubReporter.OpenLogFolder();
 
+    private void OpenManager_Click(object sender, RoutedEventArgs e)
+    {
+        new PrinterManagerWindow(_doctor) { Owner = this }.ShowDialog();
+    }
+
     private void EnableDarkTitleBar()
     {
         try

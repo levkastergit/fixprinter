@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.Eventing.Reader;
 using System.IO;
 using System.Management;
 using System.Net.NetworkInformation;
@@ -6,6 +7,7 @@ using System.Net.Sockets;
 using System.Printing;
 using System.ServiceProcess;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Text.RegularExpressions;
 using System.Windows;
 using Microsoft.Win32;
@@ -71,6 +73,8 @@ public sealed class PrinterDoctor
         CheckDuplicateQueues(results);
         CheckPaperSizesAndDefault(results);
         CheckBrowserLastPrinter(results);
+        CheckAppCrashes(results);
+        CheckPrintServiceLog(results);
         CheckStuckJobs(results);
         CheckNetworkPorts(results);
 
@@ -593,14 +597,18 @@ public sealed class PrinterDoctor
     /// Если это зависшая или не умеющая A3 очередь — предупреждаем.</summary>
     private void CheckBrowserLastPrinter(List<CheckResult> results)
     {
+        List<string> existing;
+        try { existing = ListPrinterRows().Select(r => r.Name).ToList(); }
+        catch { existing = new List<string>(); }
+
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
-        var browsers = new (string Browser, string UserData)[]
+        var browsers = new (string Browser, string Proc, string UserData)[]
         {
-            ("Chrome", Path.Combine(local, "Google", "Chrome", "User Data")),
-            ("Edge",   Path.Combine(local, "Microsoft", "Edge", "User Data"))
+            ("Chrome", "chrome", Path.Combine(local, "Google", "Chrome", "User Data")),
+            ("Edge",   "msedge", Path.Combine(local, "Microsoft", "Edge", "User Data"))
         };
 
-        foreach (var (browser, userData) in browsers)
+        foreach (var (browser, proc, userData) in browsers)
         {
             try
             {
@@ -617,7 +625,16 @@ public sealed class PrinterDoctor
                     var profile = Path.GetFileName(profileDir);
                     _log.Info($"{browser} ({profile}): последний использованный принтер — «{lastPrinter}»");
 
-                    if (_hangingQueues.Contains(lastPrinter))
+                    if (lastPrinter != "Save as PDF" && !existing.Contains(lastPrinter))
+                        results.Add(new CheckResult
+                        {
+                            Severity = Severity.Error,
+                            Title = $"{browser} запомнил принтер «{lastPrinter}», которого уже нет",
+                            Details = $"Печать в {browser} из-за этого может зависать или ронять браузер. " +
+                                      $"Сброшу запомненные настройки печати {browser} (нужно, чтобы {browser} был закрыт).",
+                            Fix = () => CleanBrowserPrintState(browser, proc, prefs)
+                        });
+                    else if (_hangingQueues.Contains(lastPrinter))
                         results.Add(new CheckResult
                         {
                             Severity = Severity.Error,
@@ -645,6 +662,229 @@ public sealed class PrinterDoctor
         }
     }
 
+    /// <summary>Сбрасывает запомненные настройки печати Chromium-браузера (с резервной копией).</summary>
+    private void CleanBrowserPrintState(string browserTitle, string processName, string prefsPath)
+    {
+        if (Process.GetProcessesByName(processName).Length > 0)
+        {
+            _log.Warn($"{browserTitle} сейчас запущен — настройки печати не сбросить, пока он открыт.");
+            MessageBox.Show(
+                $"Полностью закройте {browserTitle} и нажмите «Найти проблемы и починить» ещё раз — " +
+                "тогда я сброшу его запомненные настройки печати.",
+                "FixPrinter", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        File.Copy(prefsPath, prefsPath + ".fixprinter.bak", overwrite: true);
+        var root = JsonNode.Parse(File.ReadAllText(prefsPath))!.AsObject();
+        if (root["printing"] is JsonObject printing)
+        {
+            printing.Remove("print_preview_sticky_settings");
+            if (printing.Count == 0) root.Remove("printing");
+        }
+        File.WriteAllText(prefsPath, root.ToJsonString());
+        _log.Info($"{browserTitle}: запомненные настройки печати сброшены " +
+                  $"(резервная копия: {Path.GetFileName(prefsPath)}.fixprinter.bak). " +
+                  "При следующей печати браузер предложит принтер по умолчанию.");
+    }
+
+    private static readonly string[] PrintCrashApps =
+        { "chrome.exe", "msedge.exe", "acrord32.exe", "acrobat.exe", "splwow64.exe", "spoolsv.exe" };
+
+    /// <summary>Ищет в журнале Windows падения браузеров/Acrobat/служб печати (Event 1000)
+    /// и определяет сбойный модуль. Если модуль принадлежит драйверу принтера — чинит.</summary>
+    private void CheckAppCrashes(List<CheckResult> results)
+    {
+        try
+        {
+            const long twoWeeksMs = 14L * 24 * 3600 * 1000;
+            var query = new EventLogQuery("Application", PathType.LogName,
+                $"*[System[Provider[@Name='Application Error'] and (EventID=1000) " +
+                $"and TimeCreated[timediff(@SystemTime) <= {twoWeeksMs}]]]");
+            using var reader = new EventLogReader(query);
+
+            var crashes = new List<(DateTime Time, string App, string Module, string ModulePath)>();
+            for (EventRecord? rec; (rec = reader.ReadEvent()) != null; rec.Dispose())
+            {
+                var p = rec.Properties;
+                string S(int i) => p.Count > i ? p[i].Value?.ToString() ?? "" : "";
+                var app = S(0);
+                if (!PrintCrashApps.Contains(app, StringComparer.OrdinalIgnoreCase)) continue;
+                crashes.Add((rec.TimeCreated ?? DateTime.MinValue, app, S(3), S(11)));
+            }
+
+            if (crashes.Count == 0)
+            {
+                _log.Info("Падений браузеров/Acrobat/службы печати за 14 дней в журнале Windows нет.");
+                results.Add(new CheckResult { Severity = Severity.Ok, Title = "Аварийных завершений при печати в журнале Windows нет" });
+                return;
+            }
+
+            foreach (var group in crashes.GroupBy(c => c.App, StringComparer.OrdinalIgnoreCase))
+            {
+                var last = group.OrderByDescending(c => c.Time).First();
+                _log.Info($"Журнал Windows: {group.Key} падал {group.Count()} раз за 14 дней, " +
+                          $"последний раз {last.Time:dd.MM HH:mm}, сбойный модуль: {last.Module} ({last.ModulePath})");
+
+                var inPrintDriver = last.ModulePath.Contains(@"\spool\", StringComparison.OrdinalIgnoreCase);
+                var guiltyQueues = QueuesUsingDriverFile(last.Module);
+                if (guiltyQueues.Count > 0) inPrintDriver = true;
+
+                if (group.Key.Equals("spoolsv.exe", StringComparison.OrdinalIgnoreCase) ||
+                    group.Key.Equals("splwow64.exe", StringComparison.OrdinalIgnoreCase))
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"Служба печати аварийно завершалась ({group.Key}, {group.Count()} раз, модуль {last.Module})",
+                        Details = "Перезапущу службу печати и очищу очередь." +
+                                  (guiltyQueues.Count > 0
+                                      ? $" Сбойный модуль принадлежит драйверу: {string.Join(", ", guiltyQueues.Select(q => $"«{q}»"))} — " +
+                                        "обновите этот драйвер с сайта производителя."
+                                      : ""),
+                        Fix = RestartSpoolerAndClearQueue
+                    });
+                }
+                else if (inPrintDriver)
+                {
+                    var appName = group.Key.StartsWith("chrome") ? "Chrome"
+                        : group.Key.StartsWith("msedge") ? "Edge" : "Adobe Acrobat";
+                    var target = guiltyQueues.Count > 0 ? guiltyQueues : AllRealQueues();
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"{appName} падает при печати: сбой в драйвере принтера ({last.Module}, {group.Count()} раз за 14 дней)",
+                        Details = "Виновник: " + string.Join(", ", target.Select(q => $"«{q}»")) +
+                                  ". Отключу у него «расширенные функции печати» (печать в RAW) и перезапущу " +
+                                  "службу печати — это типовое лечение таких падений. Надёжное решение — " +
+                                  "установить свежий драйвер с сайта производителя. Обходной путь: в Chrome " +
+                                  "печатайте через системный диалог (Ctrl+Shift+P).",
+                        Fix = () =>
+                        {
+                            foreach (var q in target) SetRawOnly(q, true);
+                            RestartSpoolerAndClearQueue();
+                        }
+                    });
+                }
+                else
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Warning,
+                        Title = $"{group.Key} аварийно завершался ({group.Count()} раз за 14 дней, модуль {last.Module})",
+                        Details = "Сбойный модуль не похож на драйвер принтера. Если браузер закрывается именно " +
+                                  "при нажатии «Печать» — пришлите логи после такого случая, разберу подробнее."
+                    });
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Чтение журнала падений: " + ex.Message);
+        }
+    }
+
+    /// <summary>Ошибки журнала Microsoft-Windows-PrintService/Admin за 14 дней.</summary>
+    private void CheckPrintServiceLog(List<CheckResult> results)
+    {
+        try
+        {
+            const long twoWeeksMs = 14L * 24 * 3600 * 1000;
+            var query = new EventLogQuery("Microsoft-Windows-PrintService/Admin", PathType.LogName,
+                $"*[System[(Level=2) and TimeCreated[timediff(@SystemTime) <= {twoWeeksMs}]]]");
+            using var reader = new EventLogReader(query);
+
+            var messages = new List<string>();
+            var count = 0;
+            for (EventRecord? rec; (rec = reader.ReadEvent()) != null; rec.Dispose())
+            {
+                count++;
+                if (messages.Count < 5)
+                {
+                    string msg;
+                    try { msg = rec.FormatDescription() ?? $"EventID {rec.Id}"; }
+                    catch { msg = $"EventID {rec.Id}"; }
+                    msg = Regex.Replace(msg, @"\s+", " ").Trim();
+                    messages.Add($"{rec.TimeCreated:dd.MM HH:mm} — {(msg.Length > 220 ? msg[..220] + "…" : msg)}");
+                }
+            }
+
+            foreach (var m in messages) _log.Info("Журнал печати: " + m);
+            if (count > 0)
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Warning,
+                    Title = $"В журнале службы печати есть ошибки: {count} за 14 дней",
+                    Details = messages.FirstOrDefault() ?? ""
+                });
+            else
+                results.Add(new CheckResult { Severity = Severity.Ok, Title = "Журнал службы печати: ошибок за 14 дней нет" });
+        }
+        catch (Exception ex)
+        {
+            _log.Info("Журнал PrintService/Admin недоступен (обычно он выключен по умолчанию): " + ex.Message);
+        }
+    }
+
+    /// <summary>Какие очереди используют драйвер, в состав которого входит файл moduleFile.</summary>
+    private List<string> QueuesUsingDriverFile(string moduleFile)
+    {
+        var result = new List<string>();
+        if (string.IsNullOrWhiteSpace(moduleFile)) return result;
+        try
+        {
+            var file = Path.GetFileName(moduleFile);
+            var driverBases = new List<string>();
+            using (var drivers = new ManagementObjectSearcher("SELECT * FROM Win32_PrinterDriver"))
+            {
+                foreach (var d in drivers.Get().Cast<ManagementObject>())
+                {
+                    var paths = new List<string?>
+                    {
+                        d["DriverPath"] as string, d["ConfigFile"] as string, d["DataFile"] as string
+                    };
+                    if (d["DependentFiles"] is string[] dep) paths.AddRange(dep);
+                    if (paths.Any(path => path != null &&
+                            Path.GetFileName(path).Equals(file, StringComparison.OrdinalIgnoreCase)))
+                    {
+                        var name = (string)d["Name"]; // "Имя,версия,окружение"
+                        driverBases.Add(name.Split(',')[0]);
+                    }
+                }
+            }
+            if (driverBases.Count == 0) return result;
+            result = ListPrinterRows()
+                .Where(p => driverBases.Contains(p.Driver, StringComparer.OrdinalIgnoreCase))
+                .Select(p => p.Name).ToList();
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Поиск драйвера по модулю: " + ex.Message);
+        }
+        return result;
+    }
+
+    private List<string> AllRealQueues()
+    {
+        try { return ListPrinterRows().Where(p => !IsVirtual(p.Name)).Select(p => p.Name).ToList(); }
+        catch { return new List<string>(); }
+    }
+
+    /// <summary>Отключает/включает «расширенные функции печати» (EMF): RawOnly=true лечит
+    /// падения приложений внутри GDI-драйверов.</summary>
+    private void SetRawOnly(string printerName, bool on)
+    {
+        _log.Info($"«{printerName}»: RawOnly = {on} (расширенные функции печати {(on ? "выключены" : "включены")})…");
+        using var searcher = new ManagementObjectSearcher(
+            $"SELECT * FROM Win32_Printer WHERE Name = '{printerName.Replace("'", "''")}'");
+        foreach (var printer in searcher.Get().Cast<ManagementObject>())
+        {
+            printer["RawOnly"] = on;
+            printer.Put();
+            _log.Info($"«{printerName}»: RawOnly применён.");
+        }
+    }
+
     private static string? ReadLastPrinterFromPrefs(string prefsPath)
     {
         using var doc = JsonDocument.Parse(File.ReadAllText(prefsPath));
@@ -662,6 +902,105 @@ public sealed class PrinterDoctor
             dests[0].TryGetProperty("id", out var id))
             return id.GetString();
         return null;
+    }
+
+    // ---------- УПРАВЛЕНИЕ ПРИНТЕРАМИ (ручное удаление) ----------
+
+    public sealed record PrinterOverview(string Name, string Driver, string Port, bool Default, bool Virtual);
+
+    public List<PrinterOverview> GetPrinterOverview() =>
+        ListPrinterRows()
+            .Select(p => new PrinterOverview(p.Name, p.Driver, p.Port, p.Default, IsVirtual(p.Name)))
+            .OrderBy(p => p.Virtual).ThenBy(p => p.Name)
+            .ToList();
+
+    /// <summary>Удаляет выбранные очереди, затем их осиротевшие драйверы и TCP/IP-порты.</summary>
+    public string RemovePrinters(IReadOnlyCollection<string> names)
+    {
+        _log.Info("--- Удаление принтеров: " + string.Join("; ", names.Select(n => $"«{n}»")) + " ---");
+        var before = ListPrinterRows();
+        var selected = before.Where(r => names.Contains(r.Name)).ToList();
+
+        var removedQueues = 0;
+        foreach (var row in selected)
+        {
+            try { DeletePrinterQueue(row.Name); removedQueues++; }
+            catch (Exception ex) { _log.Error($"Не удалось удалить очередь «{row.Name}»: {ex.Message}"); }
+        }
+
+        // Перезапуск спулера освобождает файлы драйверов
+        try { RestartSpoolerAndClearQueue(); }
+        catch (Exception ex) { _log.Warn("Перезапуск службы печати: " + ex.Message); }
+
+        var remaining = ListPrinterRows();
+        var removedDrivers = 0;
+        foreach (var driver in selected.Select(s => s.Driver).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (remaining.Any(r => r.Driver.Equals(driver, StringComparison.OrdinalIgnoreCase)))
+            {
+                _log.Info($"Драйвер «{driver}» ещё используется другими принтерами — не трогаю.");
+                continue;
+            }
+            if (DeletePrinterDriver(driver)) removedDrivers++;
+        }
+
+        var removedPorts = 0;
+        var usedPorts = remaining.Select(r => r.Port).ToHashSet(StringComparer.OrdinalIgnoreCase);
+        foreach (var port in selected.Select(s => s.Port).Distinct(StringComparer.OrdinalIgnoreCase))
+        {
+            if (usedPorts.Contains(port)) continue;
+            if (DeleteTcpIpPort(port)) removedPorts++;
+        }
+
+        var summary = $"Удалено: очередей — {removedQueues}, драйверов — {removedDrivers}, портов — {removedPorts}.";
+        _log.Info(summary);
+        return summary;
+    }
+
+    private bool DeletePrinterDriver(string driverBaseName)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT * FROM Win32_PrinterDriver");
+            var ok = false;
+            foreach (var d in searcher.Get().Cast<ManagementObject>())
+            {
+                var name = (string)d["Name"];
+                if (!name.Split(',')[0].Equals(driverBaseName, StringComparison.OrdinalIgnoreCase)) continue;
+                d.Delete();
+                _log.Info($"Драйвер «{name}» удалён.");
+                ok = true;
+            }
+            if (!ok) _log.Info($"Драйвер «{driverBaseName}» не найден (возможно, уже удалён).");
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Не удалось удалить драйвер «{driverBaseName}»: {ex.Message}");
+            return false;
+        }
+    }
+
+    private bool DeleteTcpIpPort(string portName)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                $"SELECT * FROM Win32_TCPIPPrinterPort WHERE Name = '{portName.Replace("'", "''")}'");
+            var ok = false;
+            foreach (var port in searcher.Get().Cast<ManagementObject>())
+            {
+                port.Delete();
+                _log.Info($"TCP/IP-порт «{portName}» удалён.");
+                ok = true;
+            }
+            return ok;
+        }
+        catch (Exception ex)
+        {
+            _log.Warn($"Порт «{portName}» удалить не удалось (не TCP/IP-порт или занят): {ex.Message}");
+            return false;
+        }
     }
 
     private void DeletePrinterQueue(string printerName)
@@ -847,6 +1186,13 @@ public sealed class PrinterDoctor
             }
         }
         _log.Info("Служба печати остановлена.");
+
+        // splwow64 — посредник печати 32/64: зависший экземпляр портит печать из браузеров
+        foreach (var proc in Process.GetProcessesByName("splwow64"))
+        {
+            try { proc.Kill(); proc.WaitForExit(5000); _log.Info("Завершён зависший splwow64.exe."); }
+            catch { }
+        }
 
         // Очистка очереди
         var deleted = 0;

@@ -108,7 +108,8 @@
         <!-- Футер -->
         <Grid Grid.Row="5" Margin="0,14,0,0">
             <StackPanel Orientation="Horizontal" HorizontalAlignment="Left">
-                <Button Style="{StaticResource GhostButton}" Content="📁 Папка логов" Click="OpenLogs_Click"/>
+                <Button Style="{StaticResource GhostButton}" Content="🗑 Удалить принтеры…" Click="OpenManager_Click"/>
+                <Button Style="{StaticResource GhostButton}" Content="📁 Папка логов" Margin="8,0,0,0" Click="OpenLogs_Click"/>
                 <Button Style="{StaticResource GhostButton}" Content="📤 Отправить логи" Margin="8,0,0,0"
                         Click="SendLogs_Click"/>
             </StackPanel>
