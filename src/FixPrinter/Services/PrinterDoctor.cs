@@ -57,6 +57,8 @@ public sealed class PrinterDoctor
     private readonly List<string> _hangingQueues = new();
     /// <summary>Принтеры, чьи драйверы поддерживают A3.</summary>
     private readonly List<string> _a3Capable = new();
+    /// <summary>Браузеры (имена процессов), падавшие из-за драйвера принтера по журналу Windows.</summary>
+    private readonly HashSet<string> _driverCrashBrowserProcs = new(StringComparer.OrdinalIgnoreCase);
 
     public List<CheckResult> Diagnose()
     {
@@ -64,6 +66,7 @@ public sealed class PrinterDoctor
         _log.Info("--- Диагностика ---");
         _hangingQueues.Clear();
         _a3Capable.Clear();
+        _driverCrashBrowserProcs.Clear();
 
         CheckService(results, "RpcSs", "Служба удалённого вызова процедур (RPC)", critical: true);
         CheckSpooler(results);
@@ -75,6 +78,7 @@ public sealed class PrinterDoctor
         CheckPaperSizesAndDefault(results);
         CheckBrowserLastPrinter(results);
         CheckAppCrashes(results);
+        CheckBrowserCrashGuard(results);
         CheckPrintServiceLog(results);
         CheckStuckJobs(results);
         CheckNetworkPorts(results);
@@ -749,6 +753,7 @@ public sealed class PrinterDoctor
                 {
                     _log.Info($"{t.Title}: флаг print-backend-service уже включён.");
                 }
+                MarkTreatment("browser:" + t.Proc, 3);
             }
             catch (Exception ex)
             {
@@ -841,6 +846,12 @@ public sealed class PrinterDoctor
                                   "при нажатии «Печать» — пришлите логи после такого случая, разберу подробнее."
                     });
                     continue;
+                }
+
+                foreach (var app in moduleGroup.Select(c => c.App).Distinct(StringComparer.OrdinalIgnoreCase))
+                {
+                    if (app.StartsWith("chrome", StringComparison.OrdinalIgnoreCase)) _driverCrashBrowserProcs.Add("chrome");
+                    else if (app.StartsWith("msedge", StringComparison.OrdinalIgnoreCase)) _driverCrashBrowserProcs.Add("msedge");
                 }
 
                 var target = guiltyQueues.Count > 0 ? guiltyQueues : AllRealQueues();
@@ -964,6 +975,134 @@ public sealed class PrinterDoctor
         {
             _log.Warn("Чтение журнала падений: " + ex.Message);
         }
+    }
+
+    /// <summary>Защита браузера от падений при печати. Смотрит крэш-дампы самого браузера
+    /// (Crashpad — ловит и те падения, которых нет в журнале Windows), проверяет флаг
+    /// print-backend-service и при необходимости эскалирует до системного диалога печати.</summary>
+    private void CheckBrowserCrashGuard(List<CheckResult> results)
+    {
+        const string flag = "print-backend-service@1";
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var targets = new (string Title, string Proc, string UserData)[]
+        {
+            ("Chrome", "chrome", Path.Combine(local, "Google", "Chrome", "User Data")),
+            ("Edge",   "msedge", Path.Combine(local, "Microsoft", "Edge", "User Data"))
+        };
+
+        foreach (var t in targets)
+        {
+            try
+            {
+                if (!Directory.Exists(t.UserData)) continue;
+
+                // Включён ли флаг печати через отдельный процесс
+                var flagEnabled = false;
+                var localState = Path.Combine(t.UserData, "Local State");
+                try
+                {
+                    if (File.Exists(localState))
+                    {
+                        var root = JsonNode.Parse(File.ReadAllText(localState))!.AsObject();
+                        flagEnabled = root["browser"]?["enabled_labs_experiments"] is JsonArray arr &&
+                                      arr.Any(n => (string?)n == flag);
+                    }
+                }
+                catch (Exception ex) { _log.Warn($"{t.Title} Local State: {ex.Message}"); }
+
+                // Свежие крэш-дампы Crashpad (последние 3 дня)
+                var dumps = 0;
+                var lastDump = DateTime.MinValue;
+                var crashDir = Path.Combine(t.UserData, "Crashpad");
+                if (Directory.Exists(crashDir))
+                {
+                    foreach (var f in Directory.EnumerateFiles(crashDir, "*.dmp", SearchOption.AllDirectories))
+                    {
+                        var w = File.GetLastWriteTime(f);
+                        if (DateTime.Now - w > TimeSpan.FromDays(3)) continue;
+                        dumps++;
+                        if (w > lastDump) lastDump = w;
+                    }
+                }
+
+                _log.Info($"{t.Title}: защита печати (print-backend-service): " +
+                          $"{(flagEnabled ? "ВКЛЮЧЕНА" : "выключена")}; крэш-дампов за 3 дня: {dumps}" +
+                          (dumps > 0 ? $", последний {lastDump:dd.MM HH:mm}" : ""));
+
+                var suspect = _driverCrashBrowserProcs.Contains(t.Proc) || dumps > 0;
+                if (!suspect)
+                {
+                    results.Add(new CheckResult { Severity = Severity.Ok, Title = $"{t.Title}: аварий при печати не замечено" });
+                    continue;
+                }
+
+                if (!flagEnabled)
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"{t.Title} аварийно завершается, а защита печати выключена" +
+                                (dumps > 0 ? $" (крэшей за 3 дня: {dumps})" : ""),
+                        Details = "Включу печать через отдельный процесс (print-backend-service): сбой драйвера " +
+                                  "принтера перестанет закрывать весь браузер. Понадобится закрыть браузер " +
+                                  "(спрошу) и потом открыть заново.",
+                        Fix = () =>
+                        {
+                            EnableOopPrinting();
+                            MarkTreatment("browser:" + t.Proc, 3);
+                        }
+                    });
+                    continue;
+                }
+
+                // Флаг уже включён: продолжаются ли падения ПОСЛЕ его включения?
+                var guard = LoadTreatments().TryGetValue("browser:" + t.Proc, out var g) ? g : null;
+                var crashesAfterGuard = guard == null ? dumps > 0
+                    : lastDump > guard.AppliedAt.AddMinutes(2);
+
+                if (crashesAfterGuard)
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"{t.Title} падает даже с включённой защитой (последний крэш {lastDump:dd.MM HH:mm})",
+                        Details = "Переведу Ctrl+P на системный диалог печати (политика браузера): встроенный " +
+                                  "предпросмотр, в котором происходит сбой, больше использоваться не будет. " +
+                                  "Печать и выбор формата (включая A3) останутся. После применения перезапустите браузер. " +
+                                  "Вернуть предпросмотр: удалить параметр DisablePrintPreview из политик (путь — в логе).",
+                        Fix = () => SetSystemPrintDialogPolicy(t.Title)
+                    });
+                }
+                else
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Ok,
+                        Title = $"{t.Title}: защита печати включена, новых падений после неё нет",
+                        Details = "Проверьте печать (Ctrl+P). Если браузер снова закроется — запустите проверку ещё раз."
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Проверка защиты {t.Title}: {ex.Message}");
+            }
+        }
+    }
+
+    /// <summary>Политика «печать через системный диалог» для браузера (HKCU, с записью в лог).</summary>
+    private void SetSystemPrintDialogPolicy(string browserTitle)
+    {
+        var keyPath = browserTitle.Equals("Edge", StringComparison.OrdinalIgnoreCase)
+            ? @"Software\Policies\Microsoft\Edge"
+            : @"Software\Policies\Google\Chrome";
+        using var key = Registry.CurrentUser.CreateSubKey(keyPath);
+        key.SetValue("DisablePrintPreview", 1, RegistryValueKind.DWord);
+        key.SetValue("UseSystemPrintDialog", 1, RegistryValueKind.DWord);
+        _log.Info($"{browserTitle}: политики DisablePrintPreview=1 и UseSystemPrintDialog=1 записаны в " +
+                  $"HKCU\\{keyPath}. Ctrl+P теперь открывает системный диалог печати. " +
+                  "Отмена: удалить эти параметры из реестра.");
+        MarkTreatment("browser-policy:" + browserTitle, 5);
     }
 
     /// <summary>Ошибки журнала Microsoft-Windows-PrintService/Admin за 14 дней.</summary>
