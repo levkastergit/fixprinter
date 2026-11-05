@@ -78,6 +78,7 @@ public sealed class PrinterDoctor
         CheckPrinters(results);
         LogDriverVersions();
         CheckDriverCompat(results);
+        CheckDriverIsolation(results);
         CheckDuplicateQueues(results);
         CheckPaperSizesAndDefault(results);
         CheckBrowserLastPrinter(results);
@@ -1398,11 +1399,11 @@ public sealed class PrinterDoctor
     private const ushort DLLCHAR_DYNAMIC_BASE = 0x0040; // ASLR
     private const ushort DLLCHAR_NX_COMPAT    = 0x0100; // DEP
 
-    /// <summary>Читает только PE-заголовок файла и возвращает поле DllCharacteristics (ASLR/DEP).
+    /// <summary>Читает только PE-заголовок файла: DllCharacteristics (ASLR/DEP), разрядность и ImageBase.
     /// Ничего не меняет в файле. false — не удалось разобрать (не PE/битый/слишком короткий).</summary>
-    private static bool TryReadDllCharacteristics(string path, out ushort flags, out string machine)
+    private static bool TryReadDllCharacteristics(string path, out ushort flags, out string machine, out ulong imageBase)
     {
-        flags = 0; machine = "?";
+        flags = 0; machine = "?"; imageBase = 0;
         try
         {
             using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
@@ -1420,8 +1421,12 @@ public sealed class PrinterDoctor
             ushort mach = BitConverter.ToUInt16(pe, 4);
             machine = mach switch { 0x8664 => "x64", 0x14c => "x86", 0xAA64 => "ARM64", _ => $"0x{mach:x4}" };
 
-            // DllCharacteristics лежит на смещении +70 Optional Header и у PE32, и у PE32+.
             const int optStart = 4 + 20; // PE sig + COFF header
+            ushort magic = BitConverter.ToUInt16(pe, optStart); // 0x10b=PE32, 0x20b=PE32+
+            imageBase = magic == 0x20b
+                ? BitConverter.ToUInt64(pe, optStart + 24)   // PE32+: ImageBase 8 байт
+                : BitConverter.ToUInt32(pe, optStart + 28);  // PE32:  ImageBase 4 байта
+            // DllCharacteristics лежит на смещении +70 Optional Header и у PE32, и у PE32+.
             flags = BitConverter.ToUInt16(pe, optStart + 70);
             return true;
         }
@@ -1456,16 +1461,27 @@ public sealed class PrinterDoctor
 
                 var noAslr = new List<string>();
                 var okCount = 0;
+                var baseUsage = new Dictionary<ulong, List<string>>();
                 foreach (var f in dlls)
                 {
-                    if (!TryReadDllCharacteristics(f, out var fl, out var mach)) continue;
+                    if (!TryReadDllCharacteristics(f, out var fl, out var mach, out var imgBase)) continue;
                     var aslr = (fl & DLLCHAR_DYNAMIC_BASE) != 0;
                     var dep2 = (fl & DLLCHAR_NX_COMPAT) != 0;
                     string ver; try { ver = FileVersionInfo.GetVersionInfo(f).FileVersion ?? "?"; } catch { ver = "?"; }
                     _log.Info($"Драйвер «{baseName}» → {Path.GetFileName(f)} [{mach}] v{ver}: " +
-                              $"DllCharacteristics=0x{fl:X4} (ASLR: {(aslr ? "есть" : "НЕТ")}, DEP: {(dep2 ? "есть" : "нет")})");
+                              $"DllCharacteristics=0x{fl:X4} (ASLR: {(aslr ? "есть" : "НЕТ")}, DEP: {(dep2 ? "есть" : "нет")}), " +
+                              $"ImageBase=0x{imgBase:X}");
                     if (aslr) okCount++; else noAslr.Add(Path.GetFileName(f));
+                    if (!aslr)
+                    {
+                        if (!baseUsage.TryGetValue(imgBase, out var list)) baseUsage[imgBase] = list = new List<string>();
+                        list.Add(Path.GetFileName(f));
+                    }
                 }
+                // Несколько DLL без ASLR с ОДНОЙ базой → при совместной загрузке конфликт адресов (0xc0000005)
+                foreach (var (b, list) in baseUsage.Where(kv => kv.Value.Count > 1))
+                    _log.Warn($"Драйвер «{baseName}»: {list.Count} файлов без ASLR претендуют на один адрес " +
+                              $"0x{b:X} ({string.Join(", ", list)}) — при загрузке в один процесс это даёт сбой 0xc0000005.");
 
                 if (noAslr.Count > 0)
                 {
@@ -1496,6 +1512,62 @@ public sealed class PrinterDoctor
             }
         }
         catch (Exception ex) { _log.Warn("Проверка совместимости драйверов: " + ex.Message); }
+    }
+
+    private const string PrintPolicyKey = @"SOFTWARE\Policies\Microsoft\Windows NT\Printers";
+
+    private static bool IsDriverIsolationForced()
+    {
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(PrintPolicyKey);
+            return key?.GetValue("PrintDriverIsolationOverrideCompat") is int v && v == 1;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Принудительная изоляция драйверов печати (политика Windows
+    /// PrintDriverIsolationOverrideCompat=1): старый драйвер грузится в отдельный процесс
+    /// PrintIsolationHost.exe, и его сбой при печати не роняет службу печати и программы
+    /// (в т.ч. Adobe). Значение проверено по документации групповой политики.</summary>
+    private void CheckDriverIsolation(List<CheckResult> results)
+    {
+        if (!_foundNonAslrDriver) return; // актуально только при несовместимом (без ASLR) драйвере
+
+        var hosts = Process.GetProcessesByName("PrintIsolationHost").Length;
+        _log.Info($"Изоляция драйверов печати: PrintDriverIsolationOverrideCompat=" +
+                  $"{(IsDriverIsolationForced() ? "1 (включена)" : "нет")}; процессов PrintIsolationHost: {hosts}");
+
+        if (IsDriverIsolationForced())
+        {
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Ok,
+                Title = "Драйверы печати запускаются изолированно — защита включена"
+            });
+            return;
+        }
+
+        results.Add(new CheckResult
+        {
+            Severity = Severity.Warning,
+            Title = "Старый драйвер не изолирован — его сбой роняет службу печати и программы",
+            Details = "Включу штатную изоляцию драйверов печати Windows: драйвер Kyocera будет работать в " +
+                      "отдельном процессе (PrintIsolationHost), и его сбой при печати перестанет закрывать " +
+                      "программу печати, в том числе Adobe. Сам драйвер не меняется, настройку можно отменить. " +
+                      "Нужен перезапуск службы печати.",
+            Fix = EnableDriverIsolation
+        });
+    }
+
+    private void EnableDriverIsolation()
+    {
+        using (var key = Registry.LocalMachine.CreateSubKey(PrintPolicyKey))
+            key.SetValue("PrintDriverIsolationOverrideCompat", 1, RegistryValueKind.DWord);
+        _log.Info($"Записано HKLM\\{PrintPolicyKey}\\PrintDriverIsolationOverrideCompat=1 — " +
+                  "принудительная изоляция драйверов печати включена. Отмена: удалить это значение из реестра.");
+        RestartSpoolerAndClearQueue();
+        _log.Info("Служба печати перезапущена: старый драйвер теперь грузится в отдельный процесс PrintIsolationHost.exe.");
     }
 
     /// <summary>Какие очереди используют драйвер, в состав которого входит файл moduleFile.</summary>
