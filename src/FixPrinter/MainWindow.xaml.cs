@@ -109,11 +109,14 @@ public partial class MainWindow : Window
             _log.Info("Полный лог скопирован в буфер обмена.");
         }
         catch { /* буфер может быть занят */ }
-        GitHubReporter.SendLogs();
+        var txtPath = GitHubReporter.SendLogs();
         MessageBox.Show(
-            "В браузере откроется GitHub с уже заполненным отчётом — просто нажмите «Create».\n\n" +
-            "Полный лог также скопирован в буфер обмена (Ctrl+V, чтобы вставить).\n" +
-            "Файл лога: " + _log.LogFilePath,
+            "Открылись два окна:\n" +
+            "1) Проводник — в нём выделен файл «FixPrinter-лог.txt» (лежит на рабочем столе).\n" +
+            "2) Страница GitHub с формой отчёта.\n\n" +
+            "ПЕРЕТАЩИТЕ файл мышкой из проводника в большое текстовое поле на странице GitHub " +
+            "и нажмите зелёную кнопку Create.\n\n" +
+            "Можно и без GitHub: просто отправьте этот файл в чат (Telegram и т.п.):\n" + txtPath,
             "Отправка логов", MessageBoxButton.OK, MessageBoxImage.Information);
     }
 

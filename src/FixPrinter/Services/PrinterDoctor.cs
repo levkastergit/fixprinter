@@ -668,12 +668,27 @@ public sealed class PrinterDoctor
     {
         if (Process.GetProcessesByName(processName).Length > 0)
         {
-            _log.Warn($"{browserTitle} сейчас запущен — настройки печати не сбросить, пока он открыт.");
-            MessageBox.Show(
-                $"Полностью закройте {browserTitle} и нажмите «Найти проблемы и починить» ещё раз — " +
-                "тогда я сброшу его запомненные настройки печати.",
-                "FixPrinter", MessageBoxButton.OK, MessageBoxImage.Information);
-            return;
+            var answer = MessageBox.Show(
+                $"{browserTitle} сейчас открыт, а сбросить его настройки печати можно только при " +
+                $"закрытом браузере.\n\nЗакрыть {browserTitle} прямо сейчас? " +
+                "(вкладки восстановятся при следующем запуске)",
+                "FixPrinter — нужно ваше решение", MessageBoxButton.YesNo, MessageBoxImage.Question);
+            if (answer != MessageBoxResult.Yes)
+            {
+                _log.Warn($"{browserTitle} открыт, пользователь отказался закрывать — настройки печати не сброшены.");
+                return;
+            }
+            _log.Info($"Закрываю {browserTitle} с согласия пользователя…");
+            foreach (var proc in Process.GetProcessesByName(processName))
+            {
+                try { proc.Kill(); proc.WaitForExit(5000); } catch { }
+            }
+            Thread.Sleep(1500); // даём файлам профиля освободиться
+            if (Process.GetProcessesByName(processName).Length > 0)
+            {
+                _log.Warn($"{browserTitle} не закрылся полностью — настройки печати не трогаю.");
+                return;
+            }
         }
 
         File.Copy(prefsPath, prefsPath + ".fixprinter.bak", overwrite: true);
