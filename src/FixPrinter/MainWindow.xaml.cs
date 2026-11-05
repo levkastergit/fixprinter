@@ -127,6 +127,11 @@ public partial class MainWindow : Window
         new PrinterManagerWindow(_doctor) { Owner = this }.ShowDialog();
     }
 
+    private void OpenPrint_Click(object sender, RoutedEventArgs e)
+    {
+        new PrintWindow { Owner = this }.ShowDialog();
+    }
+
     private async void InstallDriver_Click(object sender, RoutedEventArgs e)
     {
         var downloads = System.IO.Path.Combine(

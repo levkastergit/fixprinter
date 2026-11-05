@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>FixPrinter</AssemblyName>
     <RootNamespace>FixPrinter</RootNamespace>
-    <Version>1.13.0</Version>
+    <Version>1.14.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
     <Company>levkastergit</Company>
@@ -18,8 +18,10 @@
 
   <ItemGroup>
     <PackageReference Include="System.Diagnostics.EventLog" Version="8.0.1" />
+    <PackageReference Include="System.Drawing.Common" Version="8.0.10" />
     <PackageReference Include="System.Management" Version="8.0.0" />
     <PackageReference Include="System.ServiceProcess.ServiceController" Version="8.0.1" />
+    <PackageReference Include="PDFtoImage" Version="4.1.1" />
   </ItemGroup>
 
 </Project>
