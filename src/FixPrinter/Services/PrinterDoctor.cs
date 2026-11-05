@@ -1,10 +1,13 @@
 using System.Diagnostics;
 using System.IO;
 using System.Management;
+using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Printing;
 using System.ServiceProcess;
+using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Windows;
 using Microsoft.Win32;
 
 namespace FixPrinter.Services;
@@ -48,10 +51,17 @@ public sealed class PrinterDoctor
 
     // ---------- ДИАГНОСТИКА ----------
 
+    /// <summary>Очереди, чей драйвер не ответил на опрос (виновники зависаний диалога печати).</summary>
+    private readonly List<string> _hangingQueues = new();
+    /// <summary>Принтеры, чьи драйверы поддерживают A3.</summary>
+    private readonly List<string> _a3Capable = new();
+
     public List<CheckResult> Diagnose()
     {
         var results = new List<CheckResult>();
         _log.Info("--- Диагностика ---");
+        _hangingQueues.Clear();
+        _a3Capable.Clear();
 
         CheckService(results, "RpcSs", "Служба удалённого вызова процедур (RPC)", critical: true);
         CheckSpooler(results);
@@ -60,6 +70,7 @@ public sealed class PrinterDoctor
         CheckPrinters(results);
         CheckDuplicateQueues(results);
         CheckPaperSizesAndDefault(results);
+        CheckBrowserLastPrinter(results);
         CheckStuckJobs(results);
         CheckNetworkPorts(results);
 
@@ -377,14 +388,8 @@ public sealed class PrinterDoctor
 
                 if (!task.Wait(TimeSpan.FromSeconds(12)))
                 {
-                    results.Add(new CheckResult
-                    {
-                        Severity = Severity.Error,
-                        Title = $"Драйвер принтера «{p.Name}» не отвечает (ждал 12 секунд)",
-                        Details = "Именно такие зависания драйвера заставляют тормозить диалоги печати " +
-                                  "в Chrome и Acrobat. Переустановите драйвер этого принтера " +
-                                  "(или удалите принтер, если он больше не нужен)."
-                    });
+                    _hangingQueues.Add(p.Name);
+                    results.Add(BuildHangingQueueIssue(p));
                     continue;
                 }
                 sizes = task.Result;
@@ -439,6 +444,8 @@ public sealed class PrinterDoctor
                           "Если все принтеры формата A4 — A3 на них не напечатать."
             });
 
+        _a3Capable.AddRange(a3Capable);
+
         // Принтер по умолчанию
         var def = printers.FirstOrDefault(p => p.Default);
         _log.Info("Принтер по умолчанию: " + (def == null ? "НЕ НАЗНАЧЕН" : $"«{def.Name}»"));
@@ -464,6 +471,197 @@ public sealed class PrinterDoctor
                           string.Join(", ", a3Capable.Select(n => $"«{n}»"))
             });
         }
+    }
+
+    /// <summary>Разбирается, почему очередь зависла: ищет IP WSD-устройства в реестре,
+    /// проверяет доступность по сети и подбирает подходящее лечение.</summary>
+    private CheckResult BuildHangingQueueIssue(PrinterRow p)
+    {
+        var isWsd = p.Port.StartsWith("WSD", StringComparison.OrdinalIgnoreCase);
+        string? host = null;
+        if (isWsd)
+        {
+            host = ResolveWsdDeviceHost(p.Name);
+            _log.Info($"WSD-устройство «{p.Name}»: адрес из реестра — {(host ?? "не найден")}");
+        }
+
+        if (host != null)
+        {
+            var reachable = IsDeviceReachable(host);
+            _log.Info($"«{p.Name}» ({host}): {(reachable ? "ДОСТУПЕН в сети" : "НЕДОСТУПЕН в сети")}");
+
+            if (reachable)
+                return new CheckResult
+                {
+                    Severity = Severity.Error,
+                    Title = $"Драйвер «{p.Name}» завис, хотя сам принтер в сети ({host})",
+                    Details = "Перезапущу службу печати — обычно это снимает зависание. " +
+                              "Если повторится — переустановите принтер через порт TCP/IP с драйвером Epson.",
+                    Fix = RestartSpoolerAndClearQueue
+                };
+
+            return new CheckResult
+            {
+                Severity = Severity.Error,
+                Title = $"«{p.Name}» выключен или недоступен в сети ({host}) — его очередь вешает диалоги печати",
+                Details = "Из-за этого Chrome и Acrobat тормозят при печати. Варианты: включить принтер — " +
+                          "или удалить его очередь (предложу подтверждение); когда принтер снова понадобится, " +
+                          "Windows добавит его заново (Параметры → Принтеры → Добавить устройство).",
+                Fix = () => ConfirmAndRemovePrinter(p.Name,
+                    "сейчас выключен или недоступен в сети, а его очередь печати не отвечает и подвешивает " +
+                    "диалоги печати в Chrome, Acrobat и других программах.")
+            };
+        }
+
+        return new CheckResult
+        {
+            Severity = Severity.Error,
+            Title = $"Драйвер принтера «{p.Name}» не отвечает (ждал 12 секунд)",
+            Details = "Именно такие зависания тормозят диалоги печати в Chrome и Acrobat. " +
+                      "Предложу удалить эту очередь печати (принтер можно добавить заново в любой момент).",
+            Fix = () => ConfirmAndRemovePrinter(p.Name,
+                "не отвечает: его очередь подвешивает диалоги печати в Chrome, Acrobat и других программах.")
+        };
+    }
+
+    /// <summary>Ищет адрес WSD-устройства в реестре (SWD\DAFWSDProvider → LocationInformation).</summary>
+    private string? ResolveWsdDeviceHost(string printerName)
+    {
+        try
+        {
+            using var root = Registry.LocalMachine.OpenSubKey(
+                @"SYSTEM\CurrentControlSet\Enum\SWD\DAFWSDProvider");
+            if (root == null) return null;
+
+            foreach (var sub in root.GetSubKeyNames())
+            {
+                using var dev = root.OpenSubKey(sub);
+                if (dev == null) continue;
+                var friendly = dev.GetValue("FriendlyName") as string ?? "";
+                var location = dev.GetValue("LocationInformation") as string ?? "";
+                if (friendly.Length == 0 || location.Length == 0) continue;
+
+                // Имя принтера обычно совпадает с FriendlyName устройства (или начинается с него)
+                if (printerName.Contains(friendly, StringComparison.OrdinalIgnoreCase) ||
+                    friendly.Contains(printerName, StringComparison.OrdinalIgnoreCase) ||
+                    printerName.Split(' ')[0].Equals(friendly.Split(' ')[0], StringComparison.OrdinalIgnoreCase))
+                {
+                    if (Uri.TryCreate(location, UriKind.Absolute, out var uri))
+                        return uri.Host;
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            _log.Warn("Поиск адреса WSD-устройства: " + ex.Message);
+        }
+        return null;
+    }
+
+    private bool IsDeviceReachable(string host)
+    {
+        try
+        {
+            using var ping = new Ping();
+            if (ping.Send(host, 1200).Status == IPStatus.Success) return true;
+        }
+        catch { }
+        // Пинг может быть закрыт — пробуем типичные порты печати
+        foreach (var port in new[] { 9100, 631, 80, 515 })
+            if (TcpReachable(host, port, 1200)) return true;
+        return false;
+    }
+
+    private void ConfirmAndRemovePrinter(string printerName, string reason)
+    {
+        var answer = MessageBox.Show(
+            $"Принтер «{printerName}» {reason}\n\n" +
+            "Удалить эту очередь печати? Сам принтер не пострадает — когда он понадобится, " +
+            "его можно добавить заново (Параметры → Bluetooth и устройства → Принтеры).",
+            "FixPrinter — нужно ваше решение",
+            MessageBoxButton.YesNo, MessageBoxImage.Question);
+
+        if (answer != MessageBoxResult.Yes)
+        {
+            _log.Info($"Пользователь отказался удалять очередь «{printerName}».");
+            return;
+        }
+        DeletePrinterQueue(printerName);
+    }
+
+    /// <summary>Chrome и Edge открывают печать на последнем использованном принтере.
+    /// Если это зависшая или не умеющая A3 очередь — предупреждаем.</summary>
+    private void CheckBrowserLastPrinter(List<CheckResult> results)
+    {
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var browsers = new (string Browser, string UserData)[]
+        {
+            ("Chrome", Path.Combine(local, "Google", "Chrome", "User Data")),
+            ("Edge",   Path.Combine(local, "Microsoft", "Edge", "User Data"))
+        };
+
+        foreach (var (browser, userData) in browsers)
+        {
+            try
+            {
+                if (!Directory.Exists(userData)) continue;
+                foreach (var profileDir in Directory.GetDirectories(userData)
+                             .Where(d => Path.GetFileName(d) == "Default" ||
+                                         Path.GetFileName(d).StartsWith("Profile ")))
+                {
+                    var prefs = Path.Combine(profileDir, "Preferences");
+                    if (!File.Exists(prefs)) continue;
+                    var lastPrinter = ReadLastPrinterFromPrefs(prefs);
+                    if (lastPrinter == null) continue;
+
+                    var profile = Path.GetFileName(profileDir);
+                    _log.Info($"{browser} ({profile}): последний использованный принтер — «{lastPrinter}»");
+
+                    if (_hangingQueues.Contains(lastPrinter))
+                        results.Add(new CheckResult
+                        {
+                            Severity = Severity.Error,
+                            Title = $"{browser} запомнил зависший принтер «{lastPrinter}» как последний",
+                            Details = $"Поэтому печать в {browser} тормозит с порога: диалог сразу опрашивает " +
+                                      "эту очередь. Откройте печать (Ctrl+P), дождитесь списка и выберите " +
+                                      "другой принтер — браузер запомнит новый выбор."
+                        });
+                    else if (_a3Capable.Count > 0 && !_a3Capable.Contains(lastPrinter) &&
+                             !IsVirtual(lastPrinter) && lastPrinter != "Save as PDF")
+                        results.Add(new CheckResult
+                        {
+                            Severity = Severity.Warning,
+                            Title = $"{browser} печатает на «{lastPrinter}», а он не умеет A3",
+                            Details = "В диалоге печати (Ctrl+P) выберите: " +
+                                      string.Join(", ", _a3Capable.Select(n => $"«{n}»")) +
+                                      " — там A3 есть, и браузер запомнит выбор."
+                        });
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"Проверка последнего принтера {browser}: {ex.Message}");
+            }
+        }
+    }
+
+    private static string? ReadLastPrinterFromPrefs(string prefsPath)
+    {
+        using var doc = JsonDocument.Parse(File.ReadAllText(prefsPath));
+        if (!doc.RootElement.TryGetProperty("printing", out var printing) ||
+            !printing.TryGetProperty("print_preview_sticky_settings", out var sticky) ||
+            !sticky.TryGetProperty("appState", out var appStateEl))
+            return null;
+
+        var appState = appStateEl.GetString();
+        if (string.IsNullOrEmpty(appState)) return null;
+
+        using var app = JsonDocument.Parse(appState);
+        if (app.RootElement.TryGetProperty("recentDestinations", out var dests) &&
+            dests.ValueKind == JsonValueKind.Array && dests.GetArrayLength() > 0 &&
+            dests[0].TryGetProperty("id", out var id))
+            return id.GetString();
+        return null;
     }
 
     private void DeletePrinterQueue(string printerName)
