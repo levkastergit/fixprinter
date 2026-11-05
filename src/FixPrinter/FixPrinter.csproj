@@ -8,7 +8,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>FixPrinter</AssemblyName>
     <RootNamespace>FixPrinter</RootNamespace>
-    <Version>1.3.0</Version>
+    <Version>1.4.0</Version>
     <ApplicationManifest>app.manifest</ApplicationManifest>
     <ApplicationIcon>Assets\icon.ico</ApplicationIcon>
     <Company>levkastergit</Company>

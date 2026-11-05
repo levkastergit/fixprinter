@@ -19,15 +19,18 @@ public static class GitHubReporter
         var ver = Assembly.GetExecutingAssembly().GetName().Version?.ToString(3) ?? "?";
         var title = $"Логи FixPrinter v{ver} — {Environment.MachineName}, {DateTime.Now:yyyy-MM-dd HH:mm}";
 
+        // Лог НЕ кладём в URL: кириллица в URL-кодировке раздувает ссылку в 6 раз,
+        // и GitHub отвечает «URL too long». Лог уже в буфере обмена — пользователь вставит его Ctrl+V.
         var body =
-            "**Автоматический отчёт FixPrinter** — принтер не удалось починить с первой попытки.\n\n" +
+            "**Автоматический отчёт FixPrinter** — проблему не удалось устранить автоматически.\n\n" +
             $"- Версия: v{ver}\n" +
-            $"- ОС: {Environment.OSVersion.VersionString}\n\n" +
-            "<details><summary>Лог (хвост)</summary>\n\n```\n" +
-            log.GetTail(2600) +
-            "\n```\n</details>\n\n" +
-            $"Полный лог сохранён на компьютере: `{log.LogFilePath}` — " +
-            "при необходимости перетащите файл в это окно, чтобы приложить целиком.";
+            $"- ОС: {Environment.OSVersion.VersionString}\n" +
+            $"- Компьютер: {Environment.MachineName}\n\n" +
+            "## Лог\n\n" +
+            "Полный лог уже скопирован в буфер обмена — поставьте курсор на строку ниже и нажмите **Ctrl+V**. " +
+            "Либо перетащите в это поле файл лога:\n" +
+            $"`{log.LogFilePath}`\n\n" +
+            "```\n(вставьте лог сюда)\n```";
 
         var url = $"https://github.com/{Repo}/issues/new" +
                   $"?title={WebUtility.UrlEncode(title)}" +

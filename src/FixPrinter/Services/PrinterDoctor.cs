@@ -70,6 +70,7 @@ public sealed class PrinterDoctor
         CheckSpoolFolder(results);
         CheckWindowsManagesDefault(results);
         CheckPrinters(results);
+        LogDriverVersions();
         CheckDuplicateQueues(results);
         CheckPaperSizesAndDefault(results);
         CheckBrowserLastPrinter(results);
@@ -720,60 +721,102 @@ public sealed class PrinterDoctor
                 return;
             }
 
-            foreach (var group in crashes.GroupBy(c => c.App, StringComparer.OrdinalIgnoreCase))
+            foreach (var c in crashes.OrderBy(c => c.Time))
+                _log.Info($"Журнал Windows: {c.App} упал {c.Time:dd.MM HH:mm}, модуль: {c.Module} ({c.ModulePath})");
+
+            // Падения самой подсистемы печати
+            foreach (var group in crashes
+                         .Where(c => c.App.Equals("spoolsv.exe", StringComparison.OrdinalIgnoreCase) ||
+                                     c.App.Equals("splwow64.exe", StringComparison.OrdinalIgnoreCase))
+                         .GroupBy(c => c.App, StringComparer.OrdinalIgnoreCase))
             {
                 var last = group.OrderByDescending(c => c.Time).First();
-                _log.Info($"Журнал Windows: {group.Key} падал {group.Count()} раз за 14 дней, " +
-                          $"последний раз {last.Time:dd.MM HH:mm}, сбойный модуль: {last.Module} ({last.ModulePath})");
+                var guilty = QueuesUsingDriverFile(last.Module);
+                results.Add(new CheckResult
+                {
+                    Severity = Severity.Error,
+                    Title = $"Служба печати аварийно завершалась ({group.Key}, {group.Count()} раз, модуль {last.Module})",
+                    Details = "Перезапущу службу печати и очищу очередь." +
+                              (guilty.Count > 0
+                                  ? $" Сбойный модуль принадлежит драйверу: {string.Join(", ", guilty.Select(q => $"«{q}»"))}. " +
+                                    DriverDownloadHint(guilty)
+                                  : ""),
+                    Fix = RestartSpoolerAndClearQueue
+                });
+            }
 
-                var inPrintDriver = last.ModulePath.Contains(@"\spool\", StringComparison.OrdinalIgnoreCase);
+            // Падения приложений (Chrome/Edge/Acrobat) — группируем по сбойному модулю,
+            // чтобы не плодить одинаковые проблемы и не чинить одно и то же дважды
+            var appCrashes = crashes
+                .Where(c => !c.App.Equals("spoolsv.exe", StringComparison.OrdinalIgnoreCase) &&
+                            !c.App.Equals("splwow64.exe", StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            foreach (var moduleGroup in appCrashes.GroupBy(c => c.Module, StringComparer.OrdinalIgnoreCase))
+            {
+                var last = moduleGroup.OrderByDescending(c => c.Time).First();
+                var apps = string.Join(", ", moduleGroup
+                    .GroupBy(c => c.App, StringComparer.OrdinalIgnoreCase)
+                    .Select(g => $"{AppTitle(g.Key)} ({g.Count()} раз)"));
+
                 var guiltyQueues = QueuesUsingDriverFile(last.Module);
-                if (guiltyQueues.Count > 0) inPrintDriver = true;
+                var inPrintDriver = guiltyQueues.Count > 0 ||
+                                    last.ModulePath.Contains(@"\spool\", StringComparison.OrdinalIgnoreCase);
 
-                if (group.Key.Equals("spoolsv.exe", StringComparison.OrdinalIgnoreCase) ||
-                    group.Key.Equals("splwow64.exe", StringComparison.OrdinalIgnoreCase))
+                if (!inPrintDriver)
                 {
                     results.Add(new CheckResult
                     {
-                        Severity = Severity.Error,
-                        Title = $"Служба печати аварийно завершалась ({group.Key}, {group.Count()} раз, модуль {last.Module})",
-                        Details = "Перезапущу службу печати и очищу очередь." +
-                                  (guiltyQueues.Count > 0
-                                      ? $" Сбойный модуль принадлежит драйверу: {string.Join(", ", guiltyQueues.Select(q => $"«{q}»"))} — " +
-                                        "обновите этот драйвер с сайта производителя."
-                                      : ""),
-                        Fix = RestartSpoolerAndClearQueue
+                        Severity = Severity.Warning,
+                        Title = $"Аварийные завершения: {apps} (модуль {last.Module})",
+                        Details = "Сбойный модуль не похож на драйвер принтера. Если браузер закрывается именно " +
+                                  "при нажатии «Печать» — пришлите логи после такого случая, разберу подробнее."
                     });
+                    continue;
                 }
-                else if (inPrintDriver)
+
+                var target = guiltyQueues.Count > 0 ? guiltyQueues : AllRealQueues();
+                var appliedAt = GetRawOnlyAppliedTime(target);
+
+                if (appliedAt == null)
                 {
-                    var appName = group.Key.StartsWith("chrome") ? "Chrome"
-                        : group.Key.StartsWith("msedge") ? "Edge" : "Adobe Acrobat";
-                    var target = guiltyQueues.Count > 0 ? guiltyQueues : AllRealQueues();
                     results.Add(new CheckResult
                     {
                         Severity = Severity.Error,
-                        Title = $"{appName} падает при печати: сбой в драйвере принтера ({last.Module}, {group.Count()} раз за 14 дней)",
+                        Title = $"Падения при печати из-за драйвера принтера ({last.Module}): {apps}",
                         Details = "Виновник: " + string.Join(", ", target.Select(q => $"«{q}»")) +
                                   ". Отключу у него «расширенные функции печати» (печать в RAW) и перезапущу " +
-                                  "службу печати — это типовое лечение таких падений. Надёжное решение — " +
-                                  "установить свежий драйвер с сайта производителя. Обходной путь: в Chrome " +
-                                  "печатайте через системный диалог (Ctrl+Shift+P).",
+                                  "службу печати — это типовое лечение таких падений. " + DriverDownloadHint(target) +
+                                  " Обходной путь: в Chrome печатайте через системный диалог (Ctrl+Shift+P).",
                         Fix = () =>
                         {
                             foreach (var q in target) SetRawOnly(q, true);
                             RestartSpoolerAndClearQueue();
                         }
                     });
+                    continue;
+                }
+
+                var after = moduleGroup.Count(c => c.Time > appliedAt.Value.AddMinutes(2));
+                if (after == 0)
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Ok,
+                        Title = $"Падения из-за {last.Module} были до лечения ({appliedAt:dd.MM HH:mm}) — новых нет",
+                        Details = "Лечение (отключение расширенных функций печати) уже применено. " +
+                                  "Проверьте печать; если браузер снова закроется — запустите проверку ещё раз."
+                    });
                 }
                 else
                 {
                     results.Add(new CheckResult
                     {
-                        Severity = Severity.Warning,
-                        Title = $"{group.Key} аварийно завершался ({group.Count()} раз за 14 дней, модуль {last.Module})",
-                        Details = "Сбойный модуль не похож на драйвер принтера. Если браузер закрывается именно " +
-                                  "при нажатии «Печать» — пришлите логи после такого случая, разберу подробнее."
+                        Severity = Severity.Error,
+                        Title = $"Браузер падает из-за драйвера ({last.Module}) даже после лечения ({after} раз)",
+                        Details = "Автоматические меры исчерпаны — нужен свежий драйвер. " +
+                                  DriverDownloadHint(target) +
+                                  " До переустановки печатайте через системный диалог (Ctrl+Shift+P)."
                     });
                 }
             }
@@ -824,6 +867,108 @@ public sealed class PrinterDoctor
         {
             _log.Info("Журнал PrintService/Admin недоступен (обычно он выключен по умолчанию): " + ex.Message);
         }
+    }
+
+    private static string AppTitle(string exe) =>
+        exe.StartsWith("chrome", StringComparison.OrdinalIgnoreCase) ? "Chrome"
+        : exe.StartsWith("msedge", StringComparison.OrdinalIgnoreCase) ? "Edge"
+        : exe.StartsWith("acro", StringComparison.OrdinalIgnoreCase) ? "Adobe Acrobat"
+        : exe;
+
+    /// <summary>Подсказка, где взять свежий драйвер для конкретных очередей.</summary>
+    private string DriverDownloadHint(IEnumerable<string> queueNames)
+    {
+        var all = string.Join(" ", queueNames);
+        string driver = "";
+        try
+        {
+            var rows = ListPrinterRows();
+            driver = string.Join(" ", rows.Where(r => queueNames.Contains(r.Name)).Select(r => r.Driver));
+        }
+        catch { }
+        var hay = all + " " + driver;
+
+        if (hay.Contains("TASKalfa 180", StringComparison.OrdinalIgnoreCase) ||
+            hay.Contains("TASKalfa 220", StringComparison.OrdinalIgnoreCase))
+            return "Последний официальный драйвер — GX Driver 5.0.2906, страница загрузки Kyocera: " +
+                   "https://www.kyoceradocumentsolutions.eu/en/support/downloads.name-L2V1L2VuL21mcC9UQVNLQUxGQTE4MA==.html " +
+                   "— скачайте GX Driver, удалите текущий драйвер (кнопка «Удалить принтеры…» в FixPrinter) " +
+                   "и установите заново.";
+        if (hay.Contains("Kyocera", StringComparison.OrdinalIgnoreCase))
+            return "Свежий драйвер: https://www.kyoceradocumentsolutions.eu/en/support/downloads.html (выберите свою модель).";
+        if (hay.Contains("EPSON", StringComparison.OrdinalIgnoreCase))
+            return "Свежий драйвер: https://www.epson.ru/support (выберите свою модель).";
+        return "Установите свежий драйвер с официального сайта производителя принтера.";
+    }
+
+    // ---------- Память о применённых лечениях ----------
+
+    private static string StateFilePath => Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "FixPrinter", "state.json");
+
+    private Dictionary<string, DateTime> LoadRawOnlyState()
+    {
+        try
+        {
+            if (File.Exists(StateFilePath))
+                return JsonSerializer.Deserialize<Dictionary<string, DateTime>>(
+                           File.ReadAllText(StateFilePath)) ?? new();
+        }
+        catch (Exception ex) { _log.Warn("Чтение state.json: " + ex.Message); }
+        return new Dictionary<string, DateTime>();
+    }
+
+    private void MarkRawOnlyApplied(string printerName)
+    {
+        try
+        {
+            var state = LoadRawOnlyState();
+            state[printerName] = DateTime.Now;
+            Directory.CreateDirectory(Path.GetDirectoryName(StateFilePath)!);
+            File.WriteAllText(StateFilePath, JsonSerializer.Serialize(state));
+        }
+        catch (Exception ex) { _log.Warn("Запись state.json: " + ex.Message); }
+    }
+
+    /// <summary>Когда для этих очередей последний раз применяли RawOnly (null — не применяли).</summary>
+    private DateTime? GetRawOnlyAppliedTime(IEnumerable<string> queueNames)
+    {
+        var state = LoadRawOnlyState();
+        DateTime? best = null;
+        foreach (var name in queueNames)
+            if (state.TryGetValue(name, out var t) && (best == null || t > best))
+                best = t;
+        return best;
+    }
+
+    /// <summary>Версии файлов драйверов реальных принтеров — чтобы понимать, что именно установлено.</summary>
+    private void LogDriverVersions()
+    {
+        try
+        {
+            var used = ListPrinterRows().Where(p => !IsVirtual(p.Name))
+                .Select(p => p.Driver).Distinct(StringComparer.OrdinalIgnoreCase).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            if (used.Count == 0) return;
+
+            using var drivers = new ManagementObjectSearcher("SELECT * FROM Win32_PrinterDriver");
+            foreach (var d in drivers.Get().Cast<ManagementObject>())
+            {
+                var baseName = ((string)d["Name"]).Split(',')[0];
+                if (!used.Contains(baseName)) continue;
+                var parts = new List<string>();
+                foreach (var key in new[] { "DriverPath", "ConfigFile", "DataFile" })
+                {
+                    if (d[key] is not string path || !File.Exists(path)) continue;
+                    string ver;
+                    try { ver = FileVersionInfo.GetVersionInfo(path).FileVersion ?? "?"; }
+                    catch { ver = "?"; }
+                    parts.Add($"{Path.GetFileName(path)} v{ver} ({File.GetLastWriteTime(path):yyyy-MM-dd})");
+                }
+                _log.Info($"Файлы драйвера «{baseName}»: {string.Join(", ", parts)}");
+            }
+        }
+        catch (Exception ex) { _log.Warn("Версии драйверов: " + ex.Message); }
     }
 
     /// <summary>Какие очереди используют драйвер, в состав которого входит файл moduleFile.</summary>
@@ -883,6 +1028,7 @@ public sealed class PrinterDoctor
             printer.Put();
             _log.Info($"«{printerName}»: RawOnly применён.");
         }
+        if (on) MarkRawOnlyApplied(printerName);
     }
 
     private static string? ReadLastPrinterFromPrefs(string prefsPath)
