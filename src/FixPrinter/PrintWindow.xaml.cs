@@ -29,21 +29,38 @@ public partial class PrintWindow : Window
 
         ScaleCombo.ItemsSource = new[] { "Вписать в лист", "100%", "75%", "50%", "150%", "200%" };
         ScaleCombo.SelectedIndex = 0;
+        OrientCombo.ItemsSource = new[] { "Авто", "Книжная", "Альбомная" };
+        OrientCombo.SelectedIndex = 0;
+        AllowDropFilesToElevatedApp();
         LoadPrinters();
     }
 
-    // --- Починка drag&drop для программы, запущенной от администратора (обход блокировки UIPI) ---
+    // --- Починка drag&drop для программы от администратора ---
+    // Процессно-глобально разрешаем сообщения перетаскивания (иначе Windows блокирует drop из обычного проводника).
+    private void AllowDropFilesToElevatedApp()
+    {
+        try
+        {
+            foreach (uint msg in new uint[] { 0x0233 /*WM_DROPFILES*/, 0x004A /*WM_COPYDATA*/, 0x0049 /*WM_COPYGLOBALDATA*/ })
+                ChangeWindowMessageFilter(msg, 1 /*MSGFLT_ADD*/);
+        }
+        catch (Exception ex) { _log.Warn("Разрешение перетаскивания: " + ex.Message); }
+    }
+
     protected override void OnSourceInitialized(EventArgs e)
     {
         base.OnSourceInitialized(e);
         try
         {
             var h = new WindowInteropHelper(this).Handle;
-            foreach (uint msg in new uint[] { 0x0233 /*WM_DROPFILES*/, 0x004A /*WM_COPYDATA*/, 0x0049 /*WM_COPYGLOBALDATA*/ })
-                ChangeWindowMessageFilterEx(h, msg, 1 /*MSGFLT_ALLOW*/, IntPtr.Zero);
+            foreach (uint msg in new uint[] { 0x0233, 0x004A, 0x0049 })
+                ChangeWindowMessageFilterEx(h, msg, 1, IntPtr.Zero);
         }
-        catch (Exception ex) { _log.Warn("Не удалось разрешить перетаскивание: " + ex.Message); }
+        catch { }
     }
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ChangeWindowMessageFilter(uint msg, uint flag);
 
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool ChangeWindowMessageFilterEx(IntPtr hWnd, uint msg, uint action, IntPtr pChangeFilterStruct);
@@ -57,6 +74,25 @@ public partial class PrintWindow : Window
             PrinterCombo.SelectedItem = printers.FirstOrDefault(p => !IsVirtual(p)) ?? printers.FirstOrDefault();
         }
         catch (Exception ex) { _log.Error("Список принтеров: " + ex.Message); }
+    }
+
+    private void Printer_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e)
+    {
+        if (PrinterCombo.SelectedItem is not string printer) return;
+        try
+        {
+            var sources = PrintService.GetPaperSources(printer);
+            TrayCombo.ItemsSource = new[] { "Авто" }.Concat(sources).ToList();
+            TrayCombo.SelectedIndex = 0;
+
+            var duplex = new List<string> { "Нет" };
+            if (PrintService.CanDuplex(printer)) { duplex.Add("По длинной стороне"); duplex.Add("По короткой стороне"); }
+            DuplexCombo.ItemsSource = duplex;
+            DuplexCombo.SelectedIndex = 0;
+            DuplexCombo.IsEnabled = duplex.Count > 1;
+        }
+        catch (Exception ex) { _log.Warn("Возможности принтера: " + ex.Message); }
+        _ = RefreshPreview();
     }
 
     private static bool IsVirtual(string name) =>
@@ -131,6 +167,12 @@ public partial class PrintWindow : Window
 
     private void FileList_SelectionChanged(object sender, System.Windows.Controls.SelectionChangedEventArgs e) => _ = RefreshPreview();
     private void Option_Changed(object sender, RoutedEventArgs e) => _ = RefreshPreview();
+    private void Option_Changed(object sender, System.Windows.Controls.SelectionChangedEventArgs e) => _ = RefreshPreview();
+
+    private void FitToSheet_Click(object sender, RoutedEventArgs e)
+    {
+        ScaleCombo.SelectedIndex = 0; // «Вписать в лист» (вызовет пересбор предпросмотра)
+    }
 
     private void PagesBox_KeyDown(object sender, KeyEventArgs e)
     {
@@ -157,9 +199,10 @@ public partial class PrintWindow : Window
 
         var opt = BuildOptions();
         var indices = PrintService.ParsePages(PagesBox.Text, pages.Count);
+        var insets = _print.PrintableInsets(opt);
 
         var composed = await Task.Run(() =>
-            indices.Select(i => (Index: i, Png: _print.ComposeSheet(pages[i], opt))).ToList());
+            indices.Select(i => (Index: i, Png: _print.ComposeSheet(pages[i], opt, insets))).ToList());
         if (gen != _previewGen) return;
 
         PreviewList.ItemsSource = composed.Select(c => new PreviewItem
@@ -189,15 +232,31 @@ public partial class PrintWindow : Window
     {
         int.TryParse(CopiesBox.Text, out var copies);
         var (scale, percent) = ParseScale();
+        var orient = (OrientCombo.SelectedItem as string) switch
+        {
+            "Книжная" => PrintService.Orient.Portrait,
+            "Альбомная" => PrintService.Orient.Landscape,
+            _ => PrintService.Orient.Auto
+        };
+        var duplex = (DuplexCombo.SelectedItem as string) switch
+        {
+            "По длинной стороне" => PrintService.DuplexMode.Long,
+            "По короткой стороне" => PrintService.DuplexMode.Short,
+            _ => PrintService.DuplexMode.None
+        };
+        var tray = TrayCombo.SelectedItem as string;
         return new PrintService.Options
         {
             PrinterName = PrinterCombo.SelectedItem as string ?? "",
             Paper = PaperA3.IsChecked == true ? PrintService.Paper.A3 : PrintService.Paper.A4,
             Copies = Math.Clamp(copies <= 0 ? 1 : copies, 1, 99),
+            Collate = CollateBox.IsChecked == true,
             Grayscale = GrayscaleBox.IsChecked == true,
-            AutoRotate = AutoRotateBox.IsChecked == true,
+            Orientation = orient,
             Scale = scale,
             ScalePercent = percent,
+            Duplex = duplex,
+            PaperSource = (tray == null || tray == "Авто") ? null : tray,
             RenderDpi = RenderDpi
         };
     }

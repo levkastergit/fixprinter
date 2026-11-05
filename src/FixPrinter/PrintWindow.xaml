@@ -120,42 +120,58 @@
 
         <!-- Параметры -->
         <WrapPanel Grid.Row="2" Margin="0,12,0,0" Orientation="Horizontal">
-            <StackPanel Orientation="Horizontal" Margin="0,0,20,8">
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
                 <TextBlock Text="Принтер:" VerticalAlignment="Center" Margin="0,0,8,0"
                            Foreground="{StaticResource TextBrush}" FontSize="13"/>
-                <ComboBox x:Name="PrinterCombo" Width="220" Height="30" FontSize="13"/>
+                <ComboBox x:Name="PrinterCombo" Width="200" Height="30" FontSize="13"
+                          SelectionChanged="Printer_Changed"/>
             </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,0,20,8">
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
                 <TextBlock Text="Формат:" VerticalAlignment="Center" Margin="0,0,8,0"
                            Foreground="{StaticResource TextBrush}" FontSize="13"/>
-                <RadioButton x:Name="PaperA4" Content="A4" IsChecked="True" GroupName="paper" Margin="0,0,14,0"
+                <RadioButton x:Name="PaperA4" Content="A4" IsChecked="True" GroupName="paper" Margin="0,0,12,0"
                              Foreground="{StaticResource TextBrush}" FontSize="14" VerticalContentAlignment="Center"
                              Checked="Option_Changed"/>
                 <RadioButton x:Name="PaperA3" Content="A3" GroupName="paper"
                              Foreground="{StaticResource TextBrush}" FontSize="14" VerticalContentAlignment="Center"
                              Checked="Option_Changed"/>
             </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,0,20,8">
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
                 <TextBlock Text="Масштаб:" VerticalAlignment="Center" Margin="0,0,8,0"
                            Foreground="{StaticResource TextBrush}" FontSize="13"/>
-                <ComboBox x:Name="ScaleCombo" Width="140" Height="30" FontSize="13"
-                          SelectionChanged="Option_Changed"/>
+                <ComboBox x:Name="ScaleCombo" Width="130" Height="30" FontSize="13" SelectionChanged="Option_Changed"/>
+                <Button Content="⤢ Вписать в лист" Margin="8,0,0,0" Style="{StaticResource GhostButton}"
+                        Padding="10,5" FontSize="12.5" Click="FitToSheet_Click"/>
             </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,0,20,8">
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
+                <TextBlock Text="Ориентация:" VerticalAlignment="Center" Margin="0,0,8,0"
+                           Foreground="{StaticResource TextBrush}" FontSize="13"/>
+                <ComboBox x:Name="OrientCombo" Width="120" Height="30" FontSize="13" SelectionChanged="Option_Changed"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
                 <TextBlock Text="Страницы:" VerticalAlignment="Center" Margin="0,0,8,0"
                            Foreground="{StaticResource TextBrush}" FontSize="13"/>
-                <TextBox x:Name="PagesBox" Width="110" Height="28" FontSize="13" VerticalContentAlignment="Center"
-                         ToolTip="например: 1-3,5 (пусто = все)" LostFocus="Option_Changed"
-                         KeyDown="PagesBox_KeyDown"/>
+                <TextBox x:Name="PagesBox" Width="100" Height="28" FontSize="13" VerticalContentAlignment="Center"
+                         ToolTip="например: 1-3,5 (пусто = все)" LostFocus="Option_Changed" KeyDown="PagesBox_KeyDown"/>
             </StackPanel>
-            <StackPanel Orientation="Horizontal" Margin="0,0,20,8">
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
+                <TextBlock Text="Лоток:" VerticalAlignment="Center" Margin="0,0,8,0"
+                           Foreground="{StaticResource TextBrush}" FontSize="13"/>
+                <ComboBox x:Name="TrayCombo" Width="150" Height="30" FontSize="13"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
+                <TextBlock Text="Двусторонняя:" VerticalAlignment="Center" Margin="0,0,8,0"
+                           Foreground="{StaticResource TextBrush}" FontSize="13"/>
+                <ComboBox x:Name="DuplexCombo" Width="150" Height="30" FontSize="13"/>
+            </StackPanel>
+            <StackPanel Orientation="Horizontal" Margin="0,0,18,8">
                 <TextBlock Text="Копий:" VerticalAlignment="Center" Margin="0,0,8,0"
                            Foreground="{StaticResource TextBrush}" FontSize="13"/>
-                <TextBox x:Name="CopiesBox" Text="1" Width="50" Height="28" FontSize="13" VerticalContentAlignment="Center"/>
+                <TextBox x:Name="CopiesBox" Text="1" Width="46" Height="28" FontSize="13" VerticalContentAlignment="Center"/>
+                <CheckBox x:Name="CollateBox" Content="Разобрать" IsChecked="True" Margin="10,0,0,0" VerticalAlignment="Center"
+                          Foreground="{StaticResource TextBrush}" FontSize="13"/>
             </StackPanel>
             <CheckBox x:Name="GrayscaleBox" Content="Чёрно-белая" Margin="0,0,16,8" VerticalAlignment="Center"
-                      Foreground="{StaticResource TextBrush}" FontSize="13" Click="Option_Changed"/>
-            <CheckBox x:Name="AutoRotateBox" Content="Поворот под лист" IsChecked="True" VerticalAlignment="Center"
                       Foreground="{StaticResource TextBrush}" FontSize="13" Click="Option_Changed"/>
         </WrapPanel>
 

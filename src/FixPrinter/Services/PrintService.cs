@@ -9,9 +9,9 @@ using SkiaSharp;
 namespace FixPrinter.Services;
 
 /// <summary>
-/// Печать документов (PDF и Word) напрямую, минуя сбойное окно драйвера.
-/// PDF рисуется движком PDFium в растровые страницы; печать и предпросмотр используют
-/// ОДНУ геометрию (вписывание/масштаб/поворот), поэтому предпросмотр совпадает с листом.
+/// Печать PDF и Word напрямую, минуя сбойное окно драйвера. Геометрия (вписывание/масштаб/
+/// поворот) считается от ПЕЧАТАЕМОЙ области листа (с учётом полей принтера), поэтому край не
+/// обрезается, а предпросмотр совпадает с выводом.
 /// </summary>
 public sealed class PrintService
 {
@@ -19,20 +19,24 @@ public sealed class PrintService
 
     public enum Paper { A4, A3 }
     public enum ScaleMode { Fit, Percent }
+    public enum Orient { Auto, Portrait, Landscape }
+    public enum DuplexMode { None, Long, Short }
 
     public sealed class Options
     {
         public string PrinterName = "";
         public Paper Paper = Paper.A4;
         public int Copies = 1;
-        public bool AutoRotate = true;
+        public bool Collate = true;
+        public Orient Orientation = Orient.Auto;
         public bool Grayscale = false;
         public ScaleMode Scale = ScaleMode.Fit;
         public int ScalePercent = 100;
+        public DuplexMode Duplex = DuplexMode.None;
+        public string? PaperSource = null;
         public int RenderDpi = 200;
     }
 
-    /// <summary>Размер листа в дюймах (книжная ориентация). Все A-форматы имеют одно соотношение сторон.</summary>
     public static (double W, double H) PaperInches(Paper p) =>
         p == Paper.A3 ? (11.69, 16.54) : (8.27, 11.69);
 
@@ -43,14 +47,37 @@ public sealed class PrintService
         return result;
     }
 
-    // ---------- Разбор диапазона страниц ----------
+    public static List<string> GetPaperSources(string printerName)
+    {
+        var list = new List<string>();
+        try
+        {
+            using var pd = new PrintDocument();
+            pd.PrinterSettings.PrinterName = printerName;
+            if (!pd.PrinterSettings.IsValid) return list;
+            foreach (PaperSource s in pd.PrinterSettings.PaperSources) list.Add(s.SourceName);
+        }
+        catch { }
+        return list;
+    }
 
-    /// <summary>«1-3,5,8» → 0-базные индексы (в пределах total). Пусто/некорректно → все страницы.</summary>
+    public static bool CanDuplex(string printerName)
+    {
+        try
+        {
+            using var pd = new PrintDocument();
+            pd.PrinterSettings.PrinterName = printerName;
+            return pd.PrinterSettings.IsValid && pd.PrinterSettings.CanDuplex;
+        }
+        catch { return false; }
+    }
+
+    // ---------- Диапазон страниц ----------
+
     public static List<int> ParsePages(string? spec, int total)
     {
         var all = Enumerable.Range(0, total).ToList();
         if (string.IsNullOrWhiteSpace(spec)) return all;
-
         var set = new SortedSet<int>();
         foreach (var part in spec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
@@ -65,9 +92,8 @@ public sealed class PrintService
         return set.Count > 0 ? set.ToList() : all;
     }
 
-    // ---------- Рендер документа ----------
+    // ---------- Рендер ----------
 
-    /// <summary>Рендерит все страницы файла (Word → PDF при необходимости) в PNG (цветные).</summary>
     public List<byte[]> RenderFile(string path, int dpi, Action<string>? progress = null)
     {
         if (!File.Exists(path)) throw new FileNotFoundException("Файл не найден: " + path);
@@ -83,14 +109,10 @@ public sealed class PrintService
             }
             else if (ext != ".pdf")
                 throw new NotSupportedException("Поддерживаются PDF и Word (.doc/.docx/.rtf/.odt/.txt).");
-
             progress?.Invoke($"Готовлю страницы «{Path.GetFileName(path)}»…");
             return RenderPdf(pdfPath, dpi);
         }
-        finally
-        {
-            if (tempPdf != null) { try { File.Delete(tempPdf); } catch { } }
-        }
+        finally { if (tempPdf != null) { try { File.Delete(tempPdf); } catch { } } }
     }
 
     private List<byte[]> RenderPdf(string pdfPath, int dpi)
@@ -106,18 +128,23 @@ public sealed class PrintService
         return pages;
     }
 
-    // ---------- Общая геометрия (в дюймах) ----------
+    // ---------- Общая геометрия (в дюймах, относительно печатаемой области) ----------
 
     private static (bool rot, double x, double y, double w, double h) Layout(
-        int imgW, int imgH, Options opt, double sheetW, double sheetH)
+        int imgW, int imgH, Options opt, double availW, double availH)
     {
-        var rot = opt.AutoRotate && (imgW > imgH) != (sheetW > sheetH);
+        var rot = opt.Orientation switch
+        {
+            Orient.Portrait => false,
+            Orient.Landscape => true,
+            _ => imgW > imgH
+        };
         double ew = rot ? imgH : imgW, eh = rot ? imgW : imgH;
-        double pageW = ew / opt.RenderDpi, pageH = eh / opt.RenderDpi; // реальный размер страницы, дюймы
+        double pageW = ew / opt.RenderDpi, pageH = eh / opt.RenderDpi;
         double w, h;
         if (opt.Scale == ScaleMode.Fit)
         {
-            var s = Math.Min(sheetW / pageW, sheetH / pageH);
+            var s = Math.Min(availW / pageW, availH / pageH);
             w = pageW * s; h = pageH * s;
         }
         else
@@ -125,53 +152,78 @@ public sealed class PrintService
             var p = Math.Clamp(opt.ScalePercent, 5, 400) / 100.0;
             w = pageW * p; h = pageH * p;
         }
-        return (rot, (sheetW - w) / 2, (sheetH - h) / 2, w, h);
+        return (rot, (availW - w) / 2, (availH - h) / 2, w, h);
+    }
+
+    /// <summary>Поля принтера (непечатаемые края) в дюймах: слева/сверху/справа/снизу.</summary>
+    public (double L, double T, double R, double B) PrintableInsets(Options opt)
+    {
+        try
+        {
+            using var pd = new PrintDocument();
+            pd.PrinterSettings.PrinterName = opt.PrinterName;
+            if (!pd.PrinterSettings.IsValid) return (0.16, 0.16, 0.16, 0.16);
+            var ps = pd.DefaultPageSettings;
+            ps.PaperSize = FindPaper(pd.PrinterSettings, opt.Paper);
+            var pa = ps.PrintableArea;
+            double paperW = ps.PaperSize.Width, paperH = ps.PaperSize.Height;
+            double L = pa.X / 100.0, T = pa.Y / 100.0;
+            double R = (paperW - (pa.X + pa.Width)) / 100.0;
+            double B = (paperH - (pa.Y + pa.Height)) / 100.0;
+            L = Math.Clamp(L, 0, 0.6); T = Math.Clamp(T, 0, 0.6);
+            R = Math.Clamp(R, 0, 0.6); B = Math.Clamp(B, 0, 0.6);
+            if (L + T + R + B < 0.02) return (0.16, 0.16, 0.16, 0.16); // драйвер вернул 0 — берём типичное поле
+            return (L, T, R, B);
+        }
+        catch { return (0.16, 0.16, 0.16, 0.16); }
     }
 
     // ---------- Предпросмотр листа (Skia) ----------
 
-    /// <summary>Собирает PNG-картинку листа, как он выйдет на печать (для предпросмотра).</summary>
-    public byte[] ComposeSheet(byte[] pagePng, Options opt, int longSidePx = 360)
+    public byte[] ComposeSheet(byte[] pagePng, Options opt, (double L, double T, double R, double B) insets, int longSidePx = 360)
     {
         using var page = SKBitmap.Decode(pagePng);
         var (pwIn, phIn) = PaperInches(opt.Paper);
         var ppi = longSidePx / phIn;
         int sw = Math.Max(1, (int)(pwIn * ppi)), sh = Math.Max(1, (int)(phIn * ppi));
 
+        double availW = Math.Max(0.1, pwIn - insets.L - insets.R);
+        double availH = Math.Max(0.1, phIn - insets.T - insets.B);
+        var (rot, xIn, yIn, wIn, hIn) = Layout(page.Width, page.Height, opt, availW, availH);
+        double drawX = insets.L + xIn, drawY = insets.T + yIn;
+
         var sheet = new SKBitmap(sw, sh);
         using (var canvas = new SKCanvas(sheet))
         {
             canvas.Clear(SKColors.White);
-            var (rot, xIn, yIn, wIn, hIn) = Layout(page.Width, page.Height, opt, pwIn, phIn);
-            var dst = new SKRect((float)(xIn * ppi), (float)(yIn * ppi),
-                                 (float)((xIn + wIn) * ppi), (float)((yIn + hIn) * ppi));
+            var dst = new SKRect((float)(drawX * ppi), (float)(drawY * ppi),
+                                 (float)((drawX + wIn) * ppi), (float)((drawY + hIn) * ppi));
             using var paint = new SKPaint { FilterQuality = SKFilterQuality.Medium, IsAntialias = true };
-            if (opt.Grayscale)
-                paint.ColorFilter = SKColorFilter.CreateColorMatrix(GrayMatrix);
+            if (opt.Grayscale) paint.ColorFilter = SKColorFilter.CreateColorMatrix(GrayMatrix);
 
             canvas.Save();
             if (rot)
             {
-                // поворот картинки на 90° вокруг центра её места на листе
                 canvas.Translate(dst.MidX, dst.MidY);
                 canvas.RotateDegrees(90);
                 canvas.Translate(-dst.MidY, -dst.MidX);
-                var rotDst = new SKRect(dst.Top, dst.Left, dst.Bottom, dst.Right);
-                canvas.DrawBitmap(page, rotDst, paint);
+                canvas.DrawBitmap(page, new SKRect(dst.Top, dst.Left, dst.Bottom, dst.Right), paint);
             }
-            else
-            {
-                canvas.DrawBitmap(page, dst, paint);
-            }
+            else canvas.DrawBitmap(page, dst, paint);
             canvas.Restore();
 
+            // граница печатаемой области (пунктир) и граница листа
+            using var margin = new SKPaint { Style = SKPaintStyle.Stroke, Color = new SKColor(0x94, 0xA3, 0xB8, 0x80),
+                StrokeWidth = 1, PathEffect = SKPathEffect.CreateDash(new float[] { 4, 4 }, 0) };
+            canvas.DrawRect((float)(insets.L * ppi), (float)(insets.T * ppi),
+                (float)(availW * ppi), (float)(availH * ppi), margin);
             using var border = new SKPaint { Style = SKPaintStyle.Stroke, Color = new SKColor(0x33, 0x41, 0x55), StrokeWidth = 1 };
             canvas.DrawRect(0.5f, 0.5f, sw - 1, sh - 1, border);
         }
-        using var img = SKImage.FromBitmap(sheet);
-        using var data = img.Encode(SKEncodedImageFormat.Png, 90);
+        using var imgOut = SKImage.FromBitmap(sheet);
+        using var dataOut = imgOut.Encode(SKEncodedImageFormat.Png, 90);
         sheet.Dispose();
-        return data.ToArray();
+        return dataOut.ToArray();
     }
 
     private static readonly float[] GrayMatrix =
@@ -184,7 +236,6 @@ public sealed class PrintService
 
     // ---------- Печать ----------
 
-    /// <summary>Печатает заранее отрендеренные страницы (PNG) с выбранными индексами.</summary>
     public void PrintPages(IReadOnlyList<byte[]> pages, IReadOnlyList<int> indices, Options opt, string docName)
     {
         using var pd = new PrintDocument();
@@ -193,14 +244,23 @@ public sealed class PrintService
             throw new InvalidOperationException($"Принтер «{opt.PrinterName}» не найден в системе.");
         pd.DocumentName = docName;
         pd.PrinterSettings.Copies = (short)Math.Max(1, opt.Copies);
+        pd.PrinterSettings.Collate = opt.Collate;
+        if (opt.Duplex != DuplexMode.None && pd.PrinterSettings.CanDuplex)
+            pd.PrinterSettings.Duplex = opt.Duplex == DuplexMode.Long ? Duplex.Vertical : Duplex.Horizontal;
 
         var paper = FindPaper(pd.PrinterSettings, opt.Paper);
         pd.DefaultPageSettings.PaperSize = paper;
         pd.DefaultPageSettings.Color = !opt.Grayscale;
-        pd.OriginAtMargins = false;
-        _log.Info($"Печать «{docName}»: {indices.Count} стр., {paper.PaperName} " +
-                  $"({paper.Width}x{paper.Height}), масштаб {(opt.Scale == ScaleMode.Fit ? "вписать" : opt.ScalePercent + "%")}, " +
-                  $"цвет: {pd.DefaultPageSettings.Color}, копий: {pd.PrinterSettings.Copies}");
+        if (opt.PaperSource != null)
+            foreach (PaperSource s in pd.PrinterSettings.PaperSources)
+                if (s.SourceName == opt.PaperSource) { pd.DefaultPageSettings.PaperSource = s; break; }
+        pd.OriginAtMargins = false; // начало координат графики — угол печатаемой области
+
+        _log.Info($"Печать «{docName}»: {indices.Count} стр., {paper.PaperName}, " +
+                  $"масштаб {(opt.Scale == ScaleMode.Fit ? "вписать" : opt.ScalePercent + "%")}, " +
+                  $"ориентация {opt.Orientation}, цвет {pd.DefaultPageSettings.Color}, " +
+                  $"двусторонняя {pd.PrinterSettings.Duplex}, копий {pd.PrinterSettings.Copies}, " +
+                  $"лоток {pd.DefaultPageSettings.PaperSource.SourceName}");
 
         using var grayAttrs = new ImageAttributes();
         if (opt.Grayscale) grayAttrs.SetColorMatrix(new ColorMatrix(ToJagged(GrayMatrix)));
@@ -208,17 +268,18 @@ public sealed class PrintService
         var pos = 0;
         pd.PrintPage += (_, e) =>
         {
-            var area = e.PageBounds;
-            double sheetW = paper.Width / 100.0, sheetH = paper.Height / 100.0;
+            var pa = e.PageSettings.PrintableArea;
+            double availW = pa.Width > 1 ? pa.Width / 100.0 : e.PageBounds.Width / 100.0 - 0.32;
+            double availH = pa.Height > 1 ? pa.Height / 100.0 : e.PageBounds.Height / 100.0 - 0.32;
 
             using var ms = new MemoryStream(pages[indices[pos]]);
             using var src = Image.FromStream(ms);
             var img = src;
-            var (rot, xIn, yIn, wIn, hIn) = Layout(src.Width, src.Height, opt, sheetW, sheetH);
+            var (rot, xIn, yIn, wIn, hIn) = Layout(src.Width, src.Height, opt, availW, availH);
             if (rot) { img = (Image)src.Clone(); img.RotateFlip(RotateFlipType.Rotate90FlipNone); }
 
             var dst = new Rectangle(
-                (int)Math.Round(area.Left + xIn * 100), (int)Math.Round(area.Top + yIn * 100),
+                (int)Math.Round(xIn * 100), (int)Math.Round(yIn * 100),
                 (int)Math.Round(wIn * 100), (int)Math.Round(hIn * 100));
 
             e.Graphics!.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
@@ -259,8 +320,7 @@ public sealed class PrintService
         if (TryConvertWithWord(docPath, outPdf)) return outPdf;
         if (TryConvertWithLibreOffice(docPath, outPdf)) return outPdf;
         throw new InvalidOperationException(
-            "Чтобы печатать Word-документы, нужен установленный Microsoft Word или LibreOffice. " +
-            "PDF-файлы печатаются без них.");
+            "Чтобы печатать Word-документы, нужен установленный Microsoft Word или LibreOffice. PDF-файлы печатаются без них.");
     }
 
     private bool TryConvertWithWord(string docPath, string outPdf)
@@ -292,7 +352,6 @@ public sealed class PrintService
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "LibreOffice", "program", "soffice.exe")
         }.FirstOrDefault(File.Exists);
         if (soffice == null) { _log.Info("LibreOffice не найден."); return false; }
-
         var outDir = Path.GetDirectoryName(outPdf)!;
         var psi = new System.Diagnostics.ProcessStartInfo(soffice,
             $"--headless --norestore --convert-to pdf --outdir \"{outDir}\" \"{docPath}\"")
