@@ -57,8 +57,11 @@ public sealed class PrinterDoctor
     private readonly List<string> _hangingQueues = new();
     /// <summary>Принтеры, чьи драйверы поддерживают A3.</summary>
     private readonly List<string> _a3Capable = new();
-    /// <summary>Браузеры (имена процессов), падавшие из-за драйвера принтера по журналу Windows.</summary>
-    private readonly HashSet<string> _driverCrashBrowserProcs = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Браузеры (имя процесса → время последнего падения), падавшие из-за драйвера
+    /// принтера по журналу Windows.</summary>
+    private readonly Dictionary<string, DateTime> _driverCrashBrowserProcs = new(StringComparer.OrdinalIgnoreCase);
+    /// <summary>Сколько секунд после лечения ещё считать падения «старыми» (время записи события).</summary>
+    private static readonly TimeSpan TreatmentGrace = TimeSpan.FromSeconds(5);
 
     public List<CheckResult> Diagnose()
     {
@@ -711,12 +714,19 @@ public sealed class PrinterDoctor
         return Process.GetProcessesByName(processName).Length == 0;
     }
 
-    /// <summary>Включает в Chrome/Edge флаг print-backend-service: вся работа с драйвером печати
-    /// уходит в отдельный процесс, и падение драйвера больше не закрывает весь браузер.
-    /// Local State сохраняется в резервную копию; незнакомый флаг браузер просто игнорирует.</summary>
+    /// <summary>chrome://flags/#enable-oop-print-drivers (Chromium about_flags.cc, FEATURE_VALUE_TYPE
+    /// для features::kEnableOopPrintDrivers; варианты: @0 Default, @1 Enabled, @2 Disabled).
+    /// На Windows эта функция по умолчанию выключена (printing/printing_features.cc).</summary>
+    private const string OopPrintFlag = "enable-oop-print-drivers@1";
+    /// <summary>Несуществующий флаг, который ошибочно записывали версии 1.7–1.9.</summary>
+    private const string WrongOldFlag = "print-backend-service@1";
+
+    /// <summary>Включает в Chrome/Edge печать через отдельный процесс (enable-oop-print-drivers):
+    /// вызовы драйвера принтера уходят из процесса браузера, и падение драйвера больше не
+    /// закрывает весь браузер. Local State сохраняется в резервную копию.</summary>
     private void EnableOopPrinting()
     {
-        const string flag = "print-backend-service@1";
+        const string flag = OopPrintFlag;
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var targets = new (string Title, string Proc, string LocalState)[]
         {
@@ -742,17 +752,33 @@ public sealed class PrinterDoctor
                 if (browser["enabled_labs_experiments"] is not JsonArray experiments)
                     browser["enabled_labs_experiments"] = experiments = new JsonArray();
 
+                var changed = false;
+                foreach (var wrong in experiments.Where(n => (string?)n == WrongOldFlag).ToList())
+                {
+                    experiments.Remove(wrong);
+                    changed = true;
+                    _log.Info($"{t.Title}: удалён ошибочный флаг {WrongOldFlag} от прошлых версий FixPrinter.");
+                }
+                // Убираем другие варианты этого же флага (@0 Default, @2 Disabled)
+                foreach (var other in experiments.Where(n => ((string?)n ?? "").StartsWith("enable-oop-print-drivers@") &&
+                                                             (string?)n != flag).ToList())
+                {
+                    experiments.Remove(other);
+                    changed = true;
+                }
+
                 if (!experiments.Any(n => (string?)n == flag))
                 {
                     experiments.Add(flag);
-                    File.WriteAllText(t.LocalState, root.ToJsonString());
-                    _log.Info($"{t.Title}: включён флаг print-backend-service " +
-                              "(печать через отдельный процесс; резервная копия Local State сохранена).");
+                    changed = true;
+                    _log.Info($"{t.Title}: включён флаг {flag} (chrome://flags/#enable-oop-print-drivers — " +
+                              "печать через отдельный процесс; резервная копия Local State сохранена).");
                 }
                 else
                 {
-                    _log.Info($"{t.Title}: флаг print-backend-service уже включён.");
+                    _log.Info($"{t.Title}: флаг {flag} уже включён.");
                 }
+                if (changed) File.WriteAllText(t.LocalState, root.ToJsonString());
                 MarkTreatment("browser:" + t.Proc, 3);
             }
             catch (Exception ex)
@@ -848,13 +874,27 @@ public sealed class PrinterDoctor
                     continue;
                 }
 
-                foreach (var app in moduleGroup.Select(c => c.App).Distinct(StringComparer.OrdinalIgnoreCase))
+                foreach (var c in moduleGroup)
                 {
-                    if (app.StartsWith("chrome", StringComparison.OrdinalIgnoreCase)) _driverCrashBrowserProcs.Add("chrome");
-                    else if (app.StartsWith("msedge", StringComparison.OrdinalIgnoreCase)) _driverCrashBrowserProcs.Add("msedge");
+                    var proc = c.App.StartsWith("chrome", StringComparison.OrdinalIgnoreCase) ? "chrome"
+                        : c.App.StartsWith("msedge", StringComparison.OrdinalIgnoreCase) ? "msedge" : null;
+                    if (proc == null) continue;
+                    if (!_driverCrashBrowserProcs.TryGetValue(proc, out var prev) || c.Time > prev)
+                        _driverCrashBrowserProcs[proc] = c.Time;
                 }
 
                 var target = guiltyQueues.Count > 0 ? guiltyQueues : AllRealQueues();
+                if (target.Count == 0)
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Warning,
+                        Title = $"Были падения из-за драйвера ({last.Module}): {apps}",
+                        Details = "Принтер с этим драйвером сейчас не установлен — лечить очередь нечего. " +
+                                  "Установите драйвер кнопкой «Установить драйвер…»."
+                    });
+                    continue;
+                }
                 var treatment = GetTreatment(target);
 
                 if (treatment == null)
@@ -876,7 +916,7 @@ public sealed class PrinterDoctor
                     continue;
                 }
 
-                var after = moduleGroup.Count(c => c.Time > treatment.AppliedAt.AddMinutes(2));
+                var after = moduleGroup.Count(c => c.Time > treatment.AppliedAt + TreatmentGrace);
                 if (after == 0)
                 {
                     results.Add(new CheckResult
@@ -911,62 +951,18 @@ public sealed class PrinterDoctor
                         }
                     });
                 }
-                else if (treatment.Stage == 2)
-                {
-                    // Сброс DEVMODE не помог: защищаем сам браузер — выносим работу с драйвером
-                    // печати в отдельный процесс (флаг Chromium print-backend-service), чтобы
-                    // падение драйвера не закрывало весь браузер. Параллельно — страница драйвера.
-                    var hint = DriverDownloadHint(target);
-                    results.Add(new CheckResult
-                    {
-                        Severity = Severity.Error,
-                        Title = $"Браузер падает из-за драйвера ({last.Module}) и после сброса настроек ({after} раз)",
-                        Details = "Этап 3: включу в Chrome/Edge печать через отдельный процесс " +
-                                  "(print-backend-service) — тогда сбой драйвера не будет закрывать браузер. " +
-                                  "И открою страницу с драйвером для чистой переустановки — это устранит " +
-                                  "саму причину. " + hint,
-                        Fix = () =>
-                        {
-                            EnableOopPrinting();
-                            var url = Regex.Match(hint, @"https?://\S+").Value;
-                            if (url.Length > 0)
-                            {
-                                _log.Info("Открываю страницу загрузки драйвера: " + url);
-                                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-                            }
-                            foreach (var q in target) MarkTreatment(q, 3);
-                            MessageBox.Show(
-                                "Сделано два действия:\n\n" +
-                                "1) В браузере включена защита: печать теперь идёт через отдельный процесс, " +
-                                "падение драйвера не будет закрывать браузер. Проверьте печать (Ctrl+P).\n\n" +
-                                "2) Открыта страница Kyocera с драйвером. Чтобы устранить саму причину:\n" +
-                                "   • скачайте GX Driver;\n" +
-                                "   • в FixPrinter нажмите «Удалить принтеры…» и удалите принтер Kyocera вместе с драйвером;\n" +
-                                "   • установите скачанный драйвер (принтер добавится при установке).",
-                                "FixPrinter — этап 3", MessageBoxButton.OK, MessageBoxImage.Information);
-                        }
-                    });
-                }
                 else
                 {
-                    var hint = DriverDownloadHint(target);
+                    // Очередь уже лечили (RawOnly, сброс DEVMODE) или переустановили драйвер, а падения
+                    // продолжаются. Защита самого браузера — отдельной проверкой CheckBrowserCrashGuard.
                     results.Add(new CheckResult
                     {
-                        Severity = Severity.Error,
-                        Title = $"Браузер падает из-за драйвера ({last.Module}) после всех автоматических мер",
-                        Details = "Остался один надёжный шаг — чистая переустановка драйвера. Открою страницу " +
-                                  "загрузки. Порядок: 1) скачайте драйвер; 2) в FixPrinter нажмите " +
-                                  "«Удалить принтеры…» и удалите этот принтер вместе с драйвером; " +
-                                  "3) установите скачанный драйвер. " + hint,
-                        Fix = () =>
-                        {
-                            var url = Regex.Match(hint, @"https?://\S+").Value;
-                            if (url.Length > 0)
-                            {
-                                _log.Info("Открываю страницу загрузки драйвера: " + url);
-                                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
-                            }
-                        }
+                        Severity = Severity.Warning,
+                        Title = $"Падения из-за драйвера ({last.Module}) продолжаются после лечения очереди ({after} раз)",
+                        Details = "Сброс настроек и переустановка не помогли: в пакете GX 5.0.2906 тот же файл " +
+                                  $"{last.Module}, а новее драйвера для этой модели Kyocera не выпускала. " +
+                                  "Поэтому защищаю сам браузер (см. пункт про Chrome). Обходной путь, если и это " +
+                                  "не поможет: в Chrome «Сохранить как PDF», затем печатать PDF из Adobe Acrobat."
                     });
                 }
             }
@@ -977,12 +973,12 @@ public sealed class PrinterDoctor
         }
     }
 
-    /// <summary>Защита браузера от падений при печати. Смотрит крэш-дампы самого браузера
-    /// (Crashpad — ловит и те падения, которых нет в журнале Windows), проверяет флаг
-    /// print-backend-service и при необходимости эскалирует до системного диалога печати.</summary>
+    /// <summary>Защита браузера от падений при печати. Источники падений: журнал Windows
+    /// (CheckAppCrashes) и крэш-дампы Crashpad. Включает флаг enable-oop-print-drivers,
+    /// а если падения продолжаются и с ним — политику DisablePrintPreview (системный диалог).</summary>
     private void CheckBrowserCrashGuard(List<CheckResult> results)
     {
-        const string flag = "print-backend-service@1";
+        const string flag = OopPrintFlag;
         var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
         var targets = new (string Title, string Proc, string UserData)[]
         {
@@ -1025,11 +1021,17 @@ public sealed class PrinterDoctor
                     }
                 }
 
-                _log.Info($"{t.Title}: защита печати (print-backend-service): " +
-                          $"{(flagEnabled ? "ВКЛЮЧЕНА" : "выключена")}; крэш-дампов за 3 дня: {dumps}" +
-                          (dumps > 0 ? $", последний {lastDump:dd.MM HH:mm}" : ""));
+                var hasJournalCrash = _driverCrashBrowserProcs.TryGetValue(t.Proc, out var journalLast);
+                var lastCrash = hasJournalCrash && journalLast > lastDump ? journalLast : lastDump;
+                var policySet = IsPrintPreviewDisabledByPolicy(t.Title);
 
-                var suspect = _driverCrashBrowserProcs.Contains(t.Proc) || dumps > 0;
+                _log.Info($"{t.Title}: печать через отдельный процесс ({flag}): " +
+                          $"{(flagEnabled ? "ВКЛЮЧЕНА" : "выключена")}; крэш-дампов за 3 дня: {dumps}" +
+                          (dumps > 0 ? $", последний {lastDump:dd.MM HH:mm:ss}" : "") +
+                          (hasJournalCrash ? $"; последнее падение из-за драйвера по журналу: {journalLast:dd.MM HH:mm:ss}" : "") +
+                          $"; системный диалог печати (DisablePrintPreview): {(policySet ? "ВКЛЮЧЁН" : "нет")}");
+
+                var suspect = hasJournalCrash || dumps > 0;
                 if (!suspect)
                 {
                     results.Add(new CheckResult { Severity = Severity.Ok, Title = $"{t.Title}: аварий при печати не замечено" });
@@ -1043,9 +1045,10 @@ public sealed class PrinterDoctor
                         Severity = Severity.Error,
                         Title = $"{t.Title} аварийно завершается, а защита печати выключена" +
                                 (dumps > 0 ? $" (крэшей за 3 дня: {dumps})" : ""),
-                        Details = "Включу печать через отдельный процесс (print-backend-service): сбой драйвера " +
-                                  "принтера перестанет закрывать весь браузер. Понадобится закрыть браузер " +
-                                  "(спрошу) и потом открыть заново.",
+                        Details = "Включу печать через отдельный процесс (chrome://flags/#enable-oop-print-drivers; " +
+                                  "в Windows по умолчанию выключено): вызовы драйвера принтера уйдут из процесса " +
+                                  "браузера, и его сбой перестанет закрывать весь браузер. Понадобится закрыть " +
+                                  "браузер (спрошу) и потом открыть заново.",
                         Fix = () =>
                         {
                             EnableOopPrinting();
@@ -1056,21 +1059,35 @@ public sealed class PrinterDoctor
                 }
 
                 // Флаг уже включён: продолжаются ли падения ПОСЛЕ его включения?
-                var guard = LoadTreatments().TryGetValue("browser:" + t.Proc, out var g) ? g : null;
-                var crashesAfterGuard = guard == null ? dumps > 0
-                    : lastDump > guard.AppliedAt.AddMinutes(2);
+                var treatments = LoadTreatments();
+                var guard = treatments.TryGetValue("browser:" + t.Proc, out var g) ? g : null;
+                var policyMark = treatments.TryGetValue("browser-policy:" + t.Title, out var pm) ? pm : null;
+                var crashesAfterGuard = guard == null || lastCrash > guard.AppliedAt + TreatmentGrace;
+                var crashesAfterPolicy = policyMark == null || lastCrash > policyMark.AppliedAt + TreatmentGrace;
+                var stillCrashing = policySet ? crashesAfterPolicy : crashesAfterGuard;
 
-                if (crashesAfterGuard)
+                if (stillCrashing && t.Proc == "chrome" && !policySet)
                 {
                     results.Add(new CheckResult
                     {
                         Severity = Severity.Error,
-                        Title = $"{t.Title} падает даже с включённой защитой (последний крэш {lastDump:dd.MM HH:mm})",
-                        Details = "Переведу Ctrl+P на системный диалог печати (политика браузера): встроенный " +
-                                  "предпросмотр, в котором происходит сбой, больше использоваться не будет. " +
-                                  "Печать и выбор формата (включая A3) останутся. После применения перезапустите браузер. " +
-                                  "Вернуть предпросмотр: удалить параметр DisablePrintPreview из политик (путь — в логе).",
+                        Title = $"{t.Title} падает даже с печатью через отдельный процесс (последний раз {lastCrash:dd.MM HH:mm})",
+                        Details = "Переведу Ctrl+P на системный диалог печати Windows (политика Chrome " +
+                                  "DisablePrintPreview): встроенный предпросмотр Chrome использоваться не будет. " +
+                                  "Печать и выбор формата (включая A3) останутся. После применения перезапустите Chrome.",
                         Fix = () => SetSystemPrintDialogPolicy(t.Title)
+                    });
+                }
+                else if (stillCrashing)
+                {
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"{t.Title} падает при печати несмотря на все меры (последний раз {lastCrash:dd.MM HH:mm})",
+                        Details = "Автоматических средств больше нет: сбой внутри драйвера Kyocera, а более новой " +
+                                  "версии драйвера для этой модели нет. Надёжный обходной путь: в браузере " +
+                                  "выберите «Сохранить как PDF», затем откройте PDF в Adobe Acrobat и печатайте оттуда " +
+                                  "(падений Acrobat в журнале Windows не найдено). Пришлите лог — разберу дальше."
                     });
                 }
                 else
@@ -1090,18 +1107,32 @@ public sealed class PrinterDoctor
         }
     }
 
-    /// <summary>Политика «печать через системный диалог» для браузера (HKCU, с записью в лог).</summary>
+    private const string ChromePolicyKey = @"SOFTWARE\Policies\Google\Chrome";
+
+    private static bool IsPrintPreviewDisabledByPolicy(string browserTitle)
+    {
+        if (!browserTitle.Equals("Chrome", StringComparison.OrdinalIgnoreCase)) return false;
+        try
+        {
+            foreach (var hive in new[] { Registry.LocalMachine, Registry.CurrentUser })
+            {
+                using var key = hive.OpenSubKey(ChromePolicyKey);
+                if (key?.GetValue("DisablePrintPreview") is int v && v == 1) return true;
+            }
+        }
+        catch { }
+        return false;
+    }
+
+    /// <summary>Политика Chrome DisablePrintPreview=1 (Chrome 18+): вместо встроенного предпросмотра
+    /// открывается системный диалог печати. Пишется в HKLM (программа работает от администратора).</summary>
     private void SetSystemPrintDialogPolicy(string browserTitle)
     {
-        var keyPath = browserTitle.Equals("Edge", StringComparison.OrdinalIgnoreCase)
-            ? @"Software\Policies\Microsoft\Edge"
-            : @"Software\Policies\Google\Chrome";
-        using var key = Registry.CurrentUser.CreateSubKey(keyPath);
+        using var key = Registry.LocalMachine.CreateSubKey(ChromePolicyKey);
         key.SetValue("DisablePrintPreview", 1, RegistryValueKind.DWord);
-        key.SetValue("UseSystemPrintDialog", 1, RegistryValueKind.DWord);
-        _log.Info($"{browserTitle}: политики DisablePrintPreview=1 и UseSystemPrintDialog=1 записаны в " +
-                  $"HKCU\\{keyPath}. Ctrl+P теперь открывает системный диалог печати. " +
-                  "Отмена: удалить эти параметры из реестра.");
+        _log.Info($"{browserTitle}: политика DisablePrintPreview=1 записана в HKLM\\{ChromePolicyKey}. " +
+                  "Ctrl+P теперь открывает системный диалог печати (проверка: chrome://policy). " +
+                  "Отмена: удалить параметр DisablePrintPreview из этого раздела реестра.");
         MarkTreatment("browser-policy:" + browserTitle, 5);
     }
 
@@ -1167,7 +1198,9 @@ public sealed class PrinterDoctor
         var hay = all + " " + driver;
 
         if (hay.Contains("TASKalfa 180", StringComparison.OrdinalIgnoreCase) ||
-            hay.Contains("TASKalfa 220", StringComparison.OrdinalIgnoreCase))
+            hay.Contains("TASKalfa 220", StringComparison.OrdinalIgnoreCase) ||
+            hay.Contains("CS 180", StringComparison.OrdinalIgnoreCase) ||
+            hay.Contains("CS 220", StringComparison.OrdinalIgnoreCase))
             return "Последний официальный драйвер — GX Driver 5.0.2906, страница загрузки Kyocera: " +
                    "https://www.kyoceradocumentsolutions.eu/en/support/downloads.name-L2V1L2VuL21mcC9UQVNLQUxGQTE4MA==.html " +
                    "— скачайте GX Driver, удалите текущий драйвер (кнопка «Удалить принтеры…» в FixPrinter) " +
@@ -1492,29 +1525,164 @@ public sealed class PrinterDoctor
     /// <summary>Полный цикл замены драйвера: удаляет старые очереди и драйвер,
     /// ставит новый из выбранного .inf (pnputil + Add-PrinterDriver, фолбэк printui)
     /// и создаёт принтер заново на прежнем порту.</summary>
-    public (bool Ok, string Summary) InstallDriver(string infPath)
+    public sealed record DriverInstallPlan(List<string> Models, string Suggested, List<string> UsbDeviceIds);
+
+    /// <summary>Читает модели из INF и подбирает модель по реальному USB-устройству.
+    /// Окончательный выбор делает пользователь в окне выбора модели.</summary>
+    public DriverInstallPlan? PlanDriverInstall(string infPath, out string error)
     {
-        _log.Info($"--- Установка драйвера из {infPath} ---");
+        error = "";
+        _log.Info($"--- Подготовка установки драйвера из {infPath} ---");
+
+        string infText;
+        try { infText = File.ReadAllText(infPath); }
+        catch (Exception ex) { error = "Не удалось прочитать .inf: " + ex.Message; return null; }
+
+        var models = ParseInfModels(infText);
+        if (models.Count == 0)
+        {
+            error = "В этом .inf не нашлось моделей принтеров. Выберите основной файл драйвера " +
+                    "(у Kyocera это обычно OEMSETUP.INF в папке 64bit).";
+            return null;
+        }
+        _log.Info($"Модели в INF ({models.Count}): {string.Join("; ", models)}");
+
+        var usbIds = GetUsbPrinterDeviceIds();
+        _log.Info("USB-принтеры по данным Windows (Plug and Play): " +
+                  (usbIds.Count > 0 ? string.Join("; ", usbIds) : "не найдены"));
+
+        var suggested = SuggestModel(models, usbIds);
+        _log.Info($"Предлагаемая модель: «{suggested}»");
+        return new DriverInstallPlan(models, suggested, usbIds);
+    }
+
+    /// <summary>Модели из INF: секция [Manufacturer] → секции моделей → левые части строк
+    /// ("Имя модели" или %токен% из [Strings]). Имена производителей в список не попадают.</summary>
+    private static List<string> ParseInfModels(string infText)
+    {
+        var sections = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+        List<string>? current = null;
+        foreach (var raw in infText.Split('\n'))
+        {
+            var line = raw.Trim();
+            if (line.Length == 0 || line.StartsWith(';')) continue;
+            if (line.StartsWith('[') && line.IndexOf(']') > 1)
+            {
+                var name = line[1..line.IndexOf(']')].Trim();
+                if (!sections.TryGetValue(name, out current))
+                    sections[name] = current = new List<string>();
+                continue;
+            }
+            current?.Add(line);
+        }
+
+        var strings = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        if (sections.TryGetValue("Strings", out var stringLines))
+            foreach (var l in stringLines)
+            {
+                var eq = l.IndexOf('=');
+                if (eq > 0) strings[l[..eq].Trim()] = l[(eq + 1)..].Trim().Trim('"');
+            }
+        string Resolve(string token) =>
+            token.StartsWith('%') && token.EndsWith('%') && strings.TryGetValue(token.Trim('%'), out var v)
+                ? v : token.Trim('"');
+
+        var models = new List<string>();
+        if (sections.TryGetValue("Manufacturer", out var manufacturers))
+        {
+            foreach (var l in manufacturers)
+            {
+                var eq = l.IndexOf('=');
+                if (eq < 0) continue;
+                var parts = l[(eq + 1)..].Split(',').Select(p => p.Trim().Trim('"')).ToList();
+                if (parts.Count == 0 || parts[0].Length == 0) continue;
+                var modelSections = new List<string> { parts[0] };
+                modelSections.AddRange(parts.Skip(1).Where(p => p.Length > 0).Select(p => parts[0] + "." + p));
+                foreach (var s in modelSections)
+                {
+                    if (!sections.TryGetValue(s, out var modelLines)) continue;
+                    foreach (var ml in modelLines)
+                    {
+                        var m = Regex.Match(ml, "^(\"[^\"]+\"|%[^%]+%)\\s*=");
+                        if (m.Success) models.Add(Resolve(m.Groups[1].Value).Trim());
+                    }
+                }
+            }
+        }
+
+        if (models.Count == 0)
+        {
+            // Нестандартный INF: берём все "строки"= с цифрами (имена производителей цифр не содержат)
+            models = Regex.Matches(infText, "^\\s*\"([^\"]+)\"\\s*=", RegexOptions.Multiline)
+                .Select(m => m.Groups[1].Value.Trim())
+                .Where(m => m.Length > 3 && m.Any(char.IsDigit))
+                .ToList();
+        }
+        return models.Where(m => m.Length > 0).Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    /// <summary>Идентификаторы подключённых USB-принтеров (USBPRINT\МодельIEEE1284\…).</summary>
+    private List<string> GetUsbPrinterDeviceIds()
+    {
+        var ids = new List<string>();
+        try
+        {
+            using var searcher = new ManagementObjectSearcher(
+                "SELECT DeviceID, Name FROM Win32_PnPEntity WHERE DeviceID LIKE 'USBPRINT%'");
+            foreach (var d in searcher.Get().Cast<ManagementObject>())
+            {
+                var id = (string)(d["DeviceID"] ?? "");
+                var parts = id.Split('\\');
+                if (parts.Length >= 2) ids.Add(parts[1]);
+            }
+        }
+        catch (Exception ex) { _log.Warn("Чтение USB-устройств: " + ex.Message); }
+        return ids.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+    }
+
+    private static string Normalize(string s) =>
+        new string(s.Where(char.IsLetterOrDigit).Select(char.ToUpperInvariant).ToArray());
+
+    /// <summary>Подбор модели: совпадение с USB-идентификатором устройства; иначе — Kyocera-название
+    /// (TASKalfa), а не американский бренд Copystar (CS); иначе — первая модель с цифрами.</summary>
+    private static string SuggestModel(List<string> models, List<string> usbIds)
+    {
+        // USBPRINT-идентификатор = производитель + модель (+ контрольная сумма в конце),
+        // поэтому сравниваем по длине общего начала с нормализованным именем модели.
+        var normIds = usbIds.Select(Normalize).Where(s => s.Length > 3).ToList();
+        string? best = null;
+        var bestCommon = 0;
+        foreach (var m in models)
+        {
+            var nm = Normalize(m);
+            foreach (var id in normIds)
+            {
+                var common = 0;
+                while (common < nm.Length && common < id.Length && nm[common] == id[common]) common++;
+                // Совпадение засчитываем, только если в общей части есть номер модели
+                if (common > bestCommon && nm[..common].Any(char.IsDigit))
+                {
+                    bestCommon = common;
+                    best = m;
+                }
+            }
+        }
+        if (best != null) return best;
+
+        return models.FirstOrDefault(m => m.Contains("TASKalfa", StringComparison.OrdinalIgnoreCase) && m.Contains("180"))
+               ?? models.FirstOrDefault(m => m.Contains("TASKalfa", StringComparison.OrdinalIgnoreCase))
+               ?? models.FirstOrDefault(m => m.Any(char.IsDigit))
+               ?? models[0];
+    }
+
+    public (bool Ok, string Summary) InstallDriver(string infPath, string model)
+    {
+        _log.Info($"--- Установка драйвера «{model}» из {infPath} ---");
 
         string infText;
         try { infText = File.ReadAllText(infPath); }
         catch (Exception ex) { return (false, "Не удалось прочитать .inf: " + ex.Message); }
-
-        // Модели в INF: строки вида "Kyocera TASKalfa 180 GX"=СекцияУстановки
-        var models = Regex.Matches(infText, "^\\s*\"([^\"]+)\"\\s*=", RegexOptions.Multiline)
-            .Select(m => m.Groups[1].Value.Trim())
-            .Where(m => m.Length > 3)
-            .Distinct(StringComparer.OrdinalIgnoreCase)
-            .ToList();
-        if (models.Count == 0)
-            return (false, "В этом .inf не нашлось моделей принтеров. Выберите основной файл драйвера " +
-                           "(у Kyocera это обычно OEMSETUP.INF в папке 64bit).");
-        _log.Info($"Модели в INF ({models.Count}): {string.Join("; ", models)}");
-
-        // Выбираем модель: предпочитаем «180», при нескольких — самое короткое имя
-        var candidates = models.Where(m => m.Contains("180")).OrderBy(m => m.Length).ToList();
-        var model = candidates.FirstOrDefault() ?? models.OrderBy(m => m.Length).First();
-        _log.Info($"Выбранная модель: «{model}»");
+        var models = ParseInfModels(infText);
 
         // Старые очереди этого же драйвера/бренда
         var rows = ListPrinterRows();

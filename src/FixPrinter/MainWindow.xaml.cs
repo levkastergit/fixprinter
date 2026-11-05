@@ -139,12 +139,29 @@ public partial class MainWindow : Window
         };
         if (dialog.ShowDialog(this) != true) return;
 
+        var infPath = dialog.FileName;
+        string planError = "";
+        var plan = await Task.Run(() => _doctor.PlanDriverInstall(infPath, out planError));
+        if (plan == null)
+        {
+            ShowSummary(false, planError, "Выберите основной .inf драйвера (у Kyocera — OEMSETUP.INF).");
+            return;
+        }
+
+        var picker = new ModelPickerWindow(plan) { Owner = this };
+        if (picker.ShowDialog() != true || picker.SelectedModel == null)
+        {
+            _log.Info("Выбор модели отменён пользователем.");
+            return;
+        }
+        var model = picker.SelectedModel;
+        _log.Info($"Пользователь выбрал модель: «{model}»");
+
         SetBusy(true);
         SummaryCard.Visibility = Visibility.Collapsed;
         try
         {
-            var infPath = dialog.FileName;
-            var (ok, summary) = await Task.Run(() => _doctor.InstallDriver(infPath));
+            var (ok, summary) = await Task.Run(() => _doctor.InstallDriver(infPath, model));
             ShowSummary(ok, summary, ok
                 ? "Напечатайте пробную страницу (Параметры → Принтеры → Печать пробной страницы) и проверьте Chrome."
                 : "Нажмите «Отправить логи» — разберу, что пошло не так.");
