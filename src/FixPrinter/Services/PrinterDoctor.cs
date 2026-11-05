@@ -83,6 +83,8 @@ public sealed class PrinterDoctor
         CheckPaperSizesAndDefault(results);
         CheckBrowserLastPrinter(results);
         CheckAppCrashes(results);
+        CheckSystemAslr(results);
+        CheckRecentChanges(results);
         CheckBrowserCrashGuard(results);
         CheckPrintServiceLog(results);
         CheckStuckJobs(results);
@@ -825,6 +827,9 @@ public sealed class PrinterDoctor
             foreach (var c in crashes.OrderBy(c => c.Time))
                 _log.Info($"Журнал Windows: {c.App} упал {c.Time:dd.MM HH:mm}, модуль: {c.Module} ({c.ModulePath})");
 
+            // Самое раннее падение (за 14 дней) — ориентир «когда началось»
+            _firstPrintCrash = crashes.Min(c => c.Time);
+
             // Падения самой подсистемы печати
             foreach (var group in crashes
                          .Where(c => c.App.Equals("spoolsv.exe", StringComparison.OrdinalIgnoreCase) ||
@@ -1395,6 +1400,8 @@ public sealed class PrinterDoctor
 
     /// <summary>Драйверы печати, чьи файлы собраны без ASLR (несовместимы с защищённым процессом Chrome).</summary>
     private bool _foundNonAslrDriver;
+    /// <summary>Самое раннее падение при печати за 14 дней (когда проблема началась); null — падений нет.</summary>
+    private DateTime? _firstPrintCrash;
 
     private const ushort DLLCHAR_DYNAMIC_BASE = 0x0040; // ASLR
     private const ushort DLLCHAR_NX_COMPAT    = 0x0100; // DEP
@@ -1512,6 +1519,125 @@ public sealed class PrinterDoctor
             }
         }
         catch (Exception ex) { _log.Warn("Проверка совместимости драйверов: " + ex.Message); }
+    }
+
+    private const string MemMgmtKey = @"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management";
+
+    /// <summary>Проверяет принудительную рандомизацию образов (Mandatory ASLR). Если неделю назад
+    /// печать работала с тем же драйвером, а теперь падает во всех программах — наиболее вероятно,
+    /// что эту защиту недавно включило обновление/антивирус: она насильно сдвигает старые DLL
+    /// драйвера (они без ASLR), и те падают. Возврат к значению по умолчанию восстанавливает печать.</summary>
+    private void CheckSystemAslr(List<CheckResult> results)
+    {
+        var force = "?";
+        var (code, outp) = RunCommand("powershell.exe",
+            "-NoProfile -NonInteractive -Command \"(Get-ProcessMitigation -System).Aslr.ForceRelocateImages\"");
+        if (code == 0 && outp.Trim().Length > 0) force = outp.Trim();
+
+        int? moveImages = null;
+        try
+        {
+            using var key = Registry.LocalMachine.OpenSubKey(MemMgmtKey);
+            if (key?.GetValue("MoveImages") is int mi) moveImages = mi;
+        }
+        catch { }
+
+        _log.Info($"Mandatory ASLR (ForceRelocateImages): {force}; " +
+                  $"MoveImages={(moveImages.HasValue ? moveImages.Value.ToString() : "нет (по умолчанию)")}");
+
+        var forcedOn = force.Equals("ON", StringComparison.OrdinalIgnoreCase)
+                       || moveImages == -1;
+
+        if (!forcedOn)
+        {
+            _log.Info("Принудительная рандомизация образов не включена — эта причина исключена.");
+            return;
+        }
+
+        if (_foundNonAslrDriver)
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Error,
+                Title = "Включена принудительная рандомизация образов (Mandatory ASLR) — вероятная причина",
+                Details = "Эта защита Windows насильно сдвигает старые файлы драйвера Kyocera (они собраны без " +
+                          "ASLR), и из-за этого они падают во всех программах при печати. Если неделю назад печать " +
+                          "работала, скорее всего эту защиту недавно включило обновление Windows или антивирус. " +
+                          "Могу вернуть её в значение по умолчанию — это должно восстановить печать. Настройка " +
+                          "относится к защите памяти Windows, изменение обратимо, нужна перезагрузка.",
+                Fix = DisableMandatoryAslr
+            });
+        else
+            results.Add(new CheckResult
+            {
+                Severity = Severity.Warning,
+                Title = "Включена принудительная рандомизация образов (Mandatory ASLR)",
+                Details = "Эта защита может мешать старым драйверам печати. Сейчас несовместимого драйвера не вижу, " +
+                          "но если печать перестала работать после недавнего обновления — это вероятная причина."
+            });
+    }
+
+    private void DisableMandatoryAslr()
+    {
+        var ok = MessageBox.Show(
+            "Выключить принудительную рандомизацию образов (Mandatory ASLR)?\n\n" +
+            "Это должно восстановить работу старого драйвера печати во всех программах. Настройка относится к " +
+            "защите памяти Windows (обычные программы с актуальной защитой она не ослабляет). Изменение обратимо.\n\n" +
+            "После применения нужно ПЕРЕЗАГРУЗИТЬ компьютер. Продолжить?",
+            "FixPrinter — системная настройка", MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (ok != MessageBoxResult.Yes) { _log.Info("Пользователь отказался менять Mandatory ASLR."); return; }
+
+        var (code, outp) = RunCommand("powershell.exe",
+            "-NoProfile -NonInteractive -Command \"Set-ProcessMitigation -System -Disable ForceRelocateImages\"");
+        _log.Info($"Set-ProcessMitigation -System -Disable ForceRelocateImages → код {code}. {Shorten(outp)}");
+
+        var (code2, outp2) = RunCommand("powershell.exe",
+            "-NoProfile -NonInteractive -Command \"(Get-ProcessMitigation -System).Aslr.ForceRelocateImages\"");
+        _log.Info($"Проверка после изменения: ForceRelocateImages = {outp2.Trim()} (код {code2}).");
+
+        MessageBox.Show(
+            "Готово. ПЕРЕЗАГРУЗИТЕ компьютер и попробуйте печать снова.\n\n" +
+            "Если не поможет — пришлите лог, продолжим.",
+            "FixPrinter", MessageBoxButton.OK, MessageBoxImage.Information);
+    }
+
+    /// <summary>Выводит в лог «что менялось недавно»: когда начались падения, последние обновления
+    /// Windows, даты файлов драйвера — чтобы сопоставить регрессию с изменением системы.</summary>
+    private void CheckRecentChanges(List<CheckResult> results)
+    {
+        if (_firstPrintCrash.HasValue)
+        {
+            var days = (DateTime.Now - _firstPrintCrash.Value).TotalDays;
+            _log.Info($"Первое падение при печати (за 14 дней): {_firstPrintCrash:dd.MM.yyyy HH:mm} " +
+                      $"(~{days:F0} дн. назад) — проблема началась примерно тогда.");
+        }
+
+        // Последние обновления Windows
+        var (code, outp) = RunCommand("powershell.exe",
+            "-NoProfile -NonInteractive -Command \"Get-HotFix | Sort-Object InstalledOn -Descending | " +
+            "Select-Object -First 8 | ForEach-Object { $_.HotFixID + ' ' + $_.InstalledOn }\"");
+        if (code == 0 && outp.Trim().Length > 0)
+        {
+            _log.Info("Последние обновления Windows:");
+            foreach (var line in outp.Split('\n').Select(l => l.Trim()).Where(l => l.Length > 0))
+                _log.Info("  " + line);
+        }
+
+        // Даты файлов драйвера установленного принтера
+        try
+        {
+            var realDrivers = ListPrinterRows().Where(p => !IsVirtual(p.Name))
+                .Select(p => p.Driver).Distinct(StringComparer.OrdinalIgnoreCase).ToHashSet(StringComparer.OrdinalIgnoreCase);
+            using var drivers = new ManagementObjectSearcher("SELECT * FROM Win32_PrinterDriver");
+            foreach (var d in drivers.Get().Cast<ManagementObject>())
+            {
+                var baseName = ((string)d["Name"]).Split(',')[0];
+                if (!realDrivers.Contains(baseName)) continue;
+                if (d["DriverPath"] is string p && File.Exists(p))
+                    _log.Info($"Файл драйвера «{baseName}» ({Path.GetFileName(p)}) " +
+                              $"установлен/изменён: {File.GetLastWriteTime(p):dd.MM.yyyy}");
+            }
+        }
+        catch (Exception ex) { _log.Warn("Даты файлов драйвера: " + ex.Message); }
     }
 
     private const string PrintPolicyKey = @"SOFTWARE\Policies\Microsoft\Windows NT\Printers";
