@@ -666,29 +666,10 @@ public sealed class PrinterDoctor
     /// <summary>Сбрасывает запомненные настройки печати Chromium-браузера (с резервной копией).</summary>
     private void CleanBrowserPrintState(string browserTitle, string processName, string prefsPath)
     {
-        if (Process.GetProcessesByName(processName).Length > 0)
+        if (!EnsureBrowserClosed(browserTitle, processName))
         {
-            var answer = MessageBox.Show(
-                $"{browserTitle} сейчас открыт, а сбросить его настройки печати можно только при " +
-                $"закрытом браузере.\n\nЗакрыть {browserTitle} прямо сейчас? " +
-                "(вкладки восстановятся при следующем запуске)",
-                "FixPrinter — нужно ваше решение", MessageBoxButton.YesNo, MessageBoxImage.Question);
-            if (answer != MessageBoxResult.Yes)
-            {
-                _log.Warn($"{browserTitle} открыт, пользователь отказался закрывать — настройки печати не сброшены.");
-                return;
-            }
-            _log.Info($"Закрываю {browserTitle} с согласия пользователя…");
-            foreach (var proc in Process.GetProcessesByName(processName))
-            {
-                try { proc.Kill(); proc.WaitForExit(5000); } catch { }
-            }
-            Thread.Sleep(1500); // даём файлам профиля освободиться
-            if (Process.GetProcessesByName(processName).Length > 0)
-            {
-                _log.Warn($"{browserTitle} не закрылся полностью — настройки печати не трогаю.");
-                return;
-            }
+            _log.Warn($"{browserTitle} остался открыт — настройки печати не сброшены.");
+            return;
         }
 
         File.Copy(prefsPath, prefsPath + ".fixprinter.bak", overwrite: true);
@@ -702,6 +683,78 @@ public sealed class PrinterDoctor
         _log.Info($"{browserTitle}: запомненные настройки печати сброшены " +
                   $"(резервная копия: {Path.GetFileName(prefsPath)}.fixprinter.bak). " +
                   "При следующей печати браузер предложит принтер по умолчанию.");
+    }
+
+    /// <summary>Закрывает браузер с согласия пользователя. true — браузер закрыт (или не был запущен).</summary>
+    private bool EnsureBrowserClosed(string browserTitle, string processName)
+    {
+        if (Process.GetProcessesByName(processName).Length == 0) return true;
+        var answer = MessageBox.Show(
+            $"{browserTitle} сейчас открыт, а для этого исправления его нужно закрыть.\n\n" +
+            $"Закрыть {browserTitle} прямо сейчас? (вкладки восстановятся при следующем запуске)",
+            "FixPrinter — нужно ваше решение", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (answer != MessageBoxResult.Yes)
+        {
+            _log.Warn($"Пользователь отказался закрывать {browserTitle}.");
+            return false;
+        }
+        _log.Info($"Закрываю {browserTitle} с согласия пользователя…");
+        foreach (var proc in Process.GetProcessesByName(processName))
+        {
+            try { proc.Kill(); proc.WaitForExit(5000); } catch { }
+        }
+        Thread.Sleep(1500); // даём файлам профиля освободиться
+        return Process.GetProcessesByName(processName).Length == 0;
+    }
+
+    /// <summary>Включает в Chrome/Edge флаг print-backend-service: вся работа с драйвером печати
+    /// уходит в отдельный процесс, и падение драйвера больше не закрывает весь браузер.
+    /// Local State сохраняется в резервную копию; незнакомый флаг браузер просто игнорирует.</summary>
+    private void EnableOopPrinting()
+    {
+        const string flag = "print-backend-service@1";
+        var local = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var targets = new (string Title, string Proc, string LocalState)[]
+        {
+            ("Chrome", "chrome", Path.Combine(local, "Google", "Chrome", "User Data", "Local State")),
+            ("Edge",   "msedge", Path.Combine(local, "Microsoft", "Edge", "User Data", "Local State"))
+        };
+
+        foreach (var t in targets)
+        {
+            try
+            {
+                if (!File.Exists(t.LocalState)) continue;
+                if (!EnsureBrowserClosed(t.Title, t.Proc))
+                {
+                    _log.Warn($"{t.Title}: флаг печати через отдельный процесс не включён (браузер открыт).");
+                    continue;
+                }
+
+                File.Copy(t.LocalState, t.LocalState + ".fixprinter.bak", overwrite: true);
+                var root = JsonNode.Parse(File.ReadAllText(t.LocalState))!.AsObject();
+                if (root["browser"] is not JsonObject browser)
+                    root["browser"] = browser = new JsonObject();
+                if (browser["enabled_labs_experiments"] is not JsonArray experiments)
+                    browser["enabled_labs_experiments"] = experiments = new JsonArray();
+
+                if (!experiments.Any(n => (string?)n == flag))
+                {
+                    experiments.Add(flag);
+                    File.WriteAllText(t.LocalState, root.ToJsonString());
+                    _log.Info($"{t.Title}: включён флаг print-backend-service " +
+                              "(печать через отдельный процесс; резервная копия Local State сохранена).");
+                }
+                else
+                {
+                    _log.Info($"{t.Title}: флаг print-backend-service уже включён.");
+                }
+            }
+            catch (Exception ex)
+            {
+                _log.Warn($"{t.Title}: не удалось включить печать через отдельный процесс: {ex.Message}");
+            }
+        }
     }
 
     private static readonly string[] PrintCrashApps =
@@ -847,17 +900,53 @@ public sealed class PrinterDoctor
                         }
                     });
                 }
+                else if (treatment.Stage == 2)
+                {
+                    // Сброс DEVMODE не помог: защищаем сам браузер — выносим работу с драйвером
+                    // печати в отдельный процесс (флаг Chromium print-backend-service), чтобы
+                    // падение драйвера не закрывало весь браузер. Параллельно — страница драйвера.
+                    var hint = DriverDownloadHint(target);
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"Браузер падает из-за драйвера ({last.Module}) и после сброса настроек ({after} раз)",
+                        Details = "Этап 3: включу в Chrome/Edge печать через отдельный процесс " +
+                                  "(print-backend-service) — тогда сбой драйвера не будет закрывать браузер. " +
+                                  "И открою страницу с драйвером для чистой переустановки — это устранит " +
+                                  "саму причину. " + hint,
+                        Fix = () =>
+                        {
+                            EnableOopPrinting();
+                            var url = Regex.Match(hint, @"https?://\S+").Value;
+                            if (url.Length > 0)
+                            {
+                                _log.Info("Открываю страницу загрузки драйвера: " + url);
+                                Process.Start(new ProcessStartInfo(url) { UseShellExecute = true });
+                            }
+                            foreach (var q in target) MarkTreatment(q, 3);
+                            MessageBox.Show(
+                                "Сделано два действия:\n\n" +
+                                "1) В браузере включена защита: печать теперь идёт через отдельный процесс, " +
+                                "падение драйвера не будет закрывать браузер. Проверьте печать (Ctrl+P).\n\n" +
+                                "2) Открыта страница Kyocera с драйвером. Чтобы устранить саму причину:\n" +
+                                "   • скачайте GX Driver;\n" +
+                                "   • в FixPrinter нажмите «Удалить принтеры…» и удалите принтер Kyocera вместе с драйвером;\n" +
+                                "   • установите скачанный драйвер (принтер добавится при установке).",
+                                "FixPrinter — этап 3", MessageBoxButton.OK, MessageBoxImage.Information);
+                        }
+                    });
+                }
                 else
                 {
                     var hint = DriverDownloadHint(target);
                     results.Add(new CheckResult
                     {
                         Severity = Severity.Error,
-                        Title = $"Браузер падает из-за драйвера ({last.Module}) после двух этапов лечения",
-                        Details = "Автоматические меры исчерпаны: драйвер повреждён или несовместим — нужна " +
-                                  "чистая переустановка. Открою страницу загрузки. Порядок: 1) скачайте драйвер; " +
-                                  "2) в FixPrinter нажмите «Удалить принтеры…» и удалите этот принтер вместе с " +
-                                  "драйвером; 3) установите скачанный драйвер и добавьте принтер заново. " + hint,
+                        Title = $"Браузер падает из-за драйвера ({last.Module}) после всех автоматических мер",
+                        Details = "Остался один надёжный шаг — чистая переустановка драйвера. Открою страницу " +
+                                  "загрузки. Порядок: 1) скачайте драйвер; 2) в FixPrinter нажмите " +
+                                  "«Удалить принтеры…» и удалите этот принтер вместе с драйвером; " +
+                                  "3) установите скачанный драйвер. " + hint,
                         Fix = () =>
                         {
                             var url = Regex.Match(hint, @"https?://\S+").Value;
