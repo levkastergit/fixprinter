@@ -77,6 +77,7 @@ public sealed class PrinterDoctor
         CheckWindowsManagesDefault(results);
         CheckPrinters(results);
         LogDriverVersions();
+        CheckDriverCompat(results);
         CheckDuplicateQueues(results);
         CheckPaperSizesAndDefault(results);
         CheckBrowserLastPrinter(results);
@@ -1031,7 +1032,8 @@ public sealed class PrinterDoctor
                           (hasJournalCrash ? $"; последнее падение из-за драйвера по журналу: {journalLast:dd.MM HH:mm:ss}" : "") +
                           $"; системный диалог печати (DisablePrintPreview): {(policySet ? "ВКЛЮЧЁН" : "нет")}");
 
-                var suspect = hasJournalCrash || dumps > 0;
+                // Подозрение на проблему печати: были падения ИЛИ установлен несовместимый (без ASLR) драйвер
+                var suspect = hasJournalCrash || dumps > 0 || _foundNonAslrDriver;
                 if (!suspect)
                 {
                     results.Add(new CheckResult { Severity = Severity.Ok, Title = $"{t.Title}: аварий при печати не замечено" });
@@ -1040,21 +1042,23 @@ public sealed class PrinterDoctor
 
                 if (!flagEnabled)
                 {
-                    results.Add(new CheckResult
-                    {
-                        Severity = Severity.Error,
-                        Title = $"{t.Title} аварийно завершается, а защита печати выключена" +
-                                (dumps > 0 ? $" (крэшей за 3 дня: {dumps})" : ""),
-                        Details = "Включу печать через отдельный процесс (chrome://flags/#enable-oop-print-drivers; " +
-                                  "в Windows по умолчанию выключено): вызовы драйвера принтера уйдут из процесса " +
-                                  "браузера, и его сбой перестанет закрывать весь браузер. Понадобится закрыть " +
-                                  "браузер (спрошу) и потом открыть заново.",
-                        Fix = () =>
+                    // Если несовместимый драйвер уже выявлен CheckDriverCompat — там и предложен фикс (не дублируем).
+                    if (!_foundNonAslrDriver)
+                        results.Add(new CheckResult
                         {
-                            EnableOopPrinting();
-                            MarkTreatment("browser:" + t.Proc, 3);
-                        }
-                    });
+                            Severity = Severity.Error,
+                            Title = $"{t.Title} аварийно завершается, а защита печати выключена" +
+                                    (dumps > 0 ? $" (крэшей за 3 дня: {dumps})" : ""),
+                            Details = "Включу печать через отдельный процесс (chrome://flags/#enable-oop-print-drivers; " +
+                                      "в Windows по умолчанию выключено): вызовы драйвера принтера уйдут из процесса " +
+                                      "браузера, и его сбой перестанет закрывать весь браузер. Понадобится закрыть " +
+                                      "браузер (спрошу) и потом открыть заново.",
+                            Fix = () =>
+                            {
+                                EnableOopPrinting();
+                                MarkTreatment("browser:" + t.Proc, 3);
+                            }
+                        });
                     continue;
                 }
 
@@ -1386,6 +1390,112 @@ public sealed class PrinterDoctor
             }
         }
         catch (Exception ex) { _log.Warn("Версии драйверов: " + ex.Message); }
+    }
+
+    /// <summary>Драйверы печати, чьи файлы собраны без ASLR (несовместимы с защищённым процессом Chrome).</summary>
+    private bool _foundNonAslrDriver;
+
+    private const ushort DLLCHAR_DYNAMIC_BASE = 0x0040; // ASLR
+    private const ushort DLLCHAR_NX_COMPAT    = 0x0100; // DEP
+
+    /// <summary>Читает только PE-заголовок файла и возвращает поле DllCharacteristics (ASLR/DEP).
+    /// Ничего не меняет в файле. false — не удалось разобрать (не PE/битый/слишком короткий).</summary>
+    private static bool TryReadDllCharacteristics(string path, out ushort flags, out string machine)
+    {
+        flags = 0; machine = "?";
+        try
+        {
+            using var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+            var buf = new byte[0x200];
+            if (fs.Read(buf, 0, 0x40) < 0x40) return false;
+            if (buf[0] != (byte)'M' || buf[1] != (byte)'Z') return false;   // DOS "MZ"
+            int peOff = BitConverter.ToInt32(buf, 0x3C);
+            if (peOff <= 0 || peOff > 0x10000000) return false;
+
+            fs.Seek(peOff, SeekOrigin.Begin);
+            var pe = new byte[0x80];
+            if (fs.Read(pe, 0, pe.Length) < pe.Length) return false;
+            if (pe[0] != (byte)'P' || pe[1] != (byte)'E' || pe[2] != 0 || pe[3] != 0) return false; // "PE\0\0"
+
+            ushort mach = BitConverter.ToUInt16(pe, 4);
+            machine = mach switch { 0x8664 => "x64", 0x14c => "x86", 0xAA64 => "ARM64", _ => $"0x{mach:x4}" };
+
+            // DllCharacteristics лежит на смещении +70 Optional Header и у PE32, и у PE32+.
+            const int optStart = 4 + 20; // PE sig + COFF header
+            flags = BitConverter.ToUInt16(pe, optStart + 70);
+            return true;
+        }
+        catch { return false; }
+    }
+
+    /// <summary>Собирает ВСЕ файлы драйвера (включая зависимые) и проверяет у каждого флаг ASLR.
+    /// Старый драйвер без ASLR — корневая причина падений Chrome/Edge при печати.</summary>
+    private void CheckDriverCompat(List<CheckResult> results)
+    {
+        _foundNonAslrDriver = false;
+        try
+        {
+            var realDrivers = ListPrinterRows().Where(p => !IsVirtual(p.Name))
+                .ToDictionary(p => p.Driver, p => p.Name, StringComparer.OrdinalIgnoreCase);
+            if (realDrivers.Count == 0) return;
+
+            using var drivers = new ManagementObjectSearcher("SELECT * FROM Win32_PrinterDriver");
+            foreach (var d in drivers.Get().Cast<ManagementObject>())
+            {
+                var baseName = ((string)d["Name"]).Split(',')[0];
+                if (!realDrivers.TryGetValue(baseName, out var printerName)) continue;
+
+                // Все файлы драйвера: основные + зависимые (крэшащий модуль обычно среди зависимых)
+                var files = new List<string>();
+                foreach (var key in new[] { "DriverPath", "ConfigFile", "DataFile", "HelpFile" })
+                    if (d[key] is string s && s.Length > 0) files.Add(s);
+                if (d["DependentFiles"] is string[] dep) files.AddRange(dep);
+
+                var dlls = files.Where(f => f.EndsWith(".dll", StringComparison.OrdinalIgnoreCase) && File.Exists(f))
+                    .Distinct(StringComparer.OrdinalIgnoreCase).ToList();
+
+                var noAslr = new List<string>();
+                var okCount = 0;
+                foreach (var f in dlls)
+                {
+                    if (!TryReadDllCharacteristics(f, out var fl, out var mach)) continue;
+                    var aslr = (fl & DLLCHAR_DYNAMIC_BASE) != 0;
+                    var dep2 = (fl & DLLCHAR_NX_COMPAT) != 0;
+                    string ver; try { ver = FileVersionInfo.GetVersionInfo(f).FileVersion ?? "?"; } catch { ver = "?"; }
+                    _log.Info($"Драйвер «{baseName}» → {Path.GetFileName(f)} [{mach}] v{ver}: " +
+                              $"DllCharacteristics=0x{fl:X4} (ASLR: {(aslr ? "есть" : "НЕТ")}, DEP: {(dep2 ? "есть" : "нет")})");
+                    if (aslr) okCount++; else noAslr.Add(Path.GetFileName(f));
+                }
+
+                if (noAslr.Count > 0)
+                {
+                    _foundNonAslrDriver = true;
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Error,
+                        Title = $"Драйвер «{baseName}» несовместим с защитой Chrome/Edge " +
+                                $"(без ASLR: {string.Join(", ", noAslr)})",
+                        Details = $"Эти файлы драйвера собраны без ASLR — защиты памяти, которую требует " +
+                                  $"защищённый процесс печати Chrome и Edge. Поэтому браузер падает при печати " +
+                                  $"на «{printerName}». Сам драйвер менять нельзя (сломается подпись), новее версии " +
+                                  $"для этой модели нет. Решение — печатать мимо процесса браузера: включу печать " +
+                                  $"через отдельный процесс (enable-oop-print-drivers), а при необходимости — " +
+                                  $"системный диалог печати. Надёжный обходной путь: «Сохранить как PDF» → печать из Acrobat.",
+                        Fix = () => EnableOopPrinting()
+                    });
+                }
+                else if (dlls.Count > 0)
+                {
+                    _log.Info($"Драйвер «{baseName}»: все {okCount} DLL с ASLR — несовместимости не выявлено.");
+                    results.Add(new CheckResult
+                    {
+                        Severity = Severity.Ok,
+                        Title = $"Драйвер «{baseName}»: файлы совместимы с защитой браузера (ASLR есть)"
+                    });
+                }
+            }
+        }
+        catch (Exception ex) { _log.Warn("Проверка совместимости драйверов: " + ex.Message); }
     }
 
     /// <summary>Какие очереди используют драйвер, в состав которого входит файл moduleFile.</summary>
