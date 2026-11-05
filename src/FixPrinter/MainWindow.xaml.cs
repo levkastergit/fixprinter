@@ -127,6 +127,34 @@ public partial class MainWindow : Window
         new PrinterManagerWindow(_doctor) { Owner = this }.ShowDialog();
     }
 
+    private async void InstallDriver_Click(object sender, RoutedEventArgs e)
+    {
+        var downloads = System.IO.Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "Downloads");
+        var dialog = new Microsoft.Win32.OpenFileDialog
+        {
+            Title = "Выберите .inf из распакованного драйвера (у Kyocera — OEMSETUP.INF в папке 64bit)",
+            Filter = "Файл драйвера (*.inf)|*.inf",
+            InitialDirectory = System.IO.Directory.Exists(downloads) ? downloads : ""
+        };
+        if (dialog.ShowDialog(this) != true) return;
+
+        SetBusy(true);
+        SummaryCard.Visibility = Visibility.Collapsed;
+        try
+        {
+            var infPath = dialog.FileName;
+            var (ok, summary) = await Task.Run(() => _doctor.InstallDriver(infPath));
+            ShowSummary(ok, summary, ok
+                ? "Напечатайте пробную страницу (Параметры → Принтеры → Печать пробной страницы) и проверьте Chrome."
+                : "Нажмите «Отправить логи» — разберу, что пошло не так.");
+        }
+        finally
+        {
+            SetBusy(false);
+        }
+    }
+
     private void EnableDarkTitleBar()
     {
         try

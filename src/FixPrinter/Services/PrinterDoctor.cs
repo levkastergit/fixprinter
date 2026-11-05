@@ -1348,6 +1348,143 @@ public sealed class PrinterDoctor
         return summary;
     }
 
+    // ---------- УСТАНОВКА ДРАЙВЕРА ----------
+
+    /// <summary>Полный цикл замены драйвера: удаляет старые очереди и драйвер,
+    /// ставит новый из выбранного .inf (pnputil + Add-PrinterDriver, фолбэк printui)
+    /// и создаёт принтер заново на прежнем порту.</summary>
+    public (bool Ok, string Summary) InstallDriver(string infPath)
+    {
+        _log.Info($"--- Установка драйвера из {infPath} ---");
+
+        string infText;
+        try { infText = File.ReadAllText(infPath); }
+        catch (Exception ex) { return (false, "Не удалось прочитать .inf: " + ex.Message); }
+
+        // Модели в INF: строки вида "Kyocera TASKalfa 180 GX"=СекцияУстановки
+        var models = Regex.Matches(infText, "^\\s*\"([^\"]+)\"\\s*=", RegexOptions.Multiline)
+            .Select(m => m.Groups[1].Value.Trim())
+            .Where(m => m.Length > 3)
+            .Distinct(StringComparer.OrdinalIgnoreCase)
+            .ToList();
+        if (models.Count == 0)
+            return (false, "В этом .inf не нашлось моделей принтеров. Выберите основной файл драйвера " +
+                           "(у Kyocera это обычно OEMSETUP.INF в папке 64bit).");
+        _log.Info($"Модели в INF ({models.Count}): {string.Join("; ", models)}");
+
+        // Выбираем модель: предпочитаем «180», при нескольких — самое короткое имя
+        var candidates = models.Where(m => m.Contains("180")).OrderBy(m => m.Length).ToList();
+        var model = candidates.FirstOrDefault() ?? models.OrderBy(m => m.Length).First();
+        _log.Info($"Выбранная модель: «{model}»");
+
+        // Старые очереди этого же драйвера/бренда
+        var rows = ListPrinterRows();
+        var targets = rows.Where(r => models.Any(m => m.Equals(r.Driver, StringComparison.OrdinalIgnoreCase))).ToList();
+        if (targets.Count == 0)
+        {
+            var brand = model.Split(' ')[0];
+            targets = rows.Where(r => !IsVirtual(r.Name) &&
+                                      r.Driver.Contains(brand, StringComparison.OrdinalIgnoreCase)).ToList();
+        }
+        var port = targets.FirstOrDefault()?.Port ?? "USB001";
+        var wasDefault = targets.Count == 0 || targets.Any(t => t.Default);
+
+        var confirm = MessageBox.Show(
+            $"Будет установлен драйвер «{model}»\nиз файла: {infPath}\n\n" +
+            (targets.Count > 0
+                ? "Сначала будут удалены старые очереди и их драйвер:\n" +
+                  string.Join("\n", targets.Select(t => "• " + t.Name)) + "\n\n"
+                : "") +
+            $"Затем принтер будет создан заново на порту {port}.\n\nПродолжить?",
+            "FixPrinter — установка драйвера", MessageBoxButton.YesNo, MessageBoxImage.Question);
+        if (confirm != MessageBoxResult.Yes)
+        {
+            _log.Info("Установка драйвера отменена пользователем.");
+            return (false, "Установка отменена.");
+        }
+
+        // 1. Удаляем старое (очередь + осиротевший драйвер; спулер перезапустится внутри)
+        if (targets.Count > 0)
+            RemovePrinters(targets.Select(t => t.Name).ToList());
+
+        // 2. Кладём драйвер в хранилище Windows
+        var (pnpCode, pnpOut) = RunCommand("pnputil.exe", $"/add-driver \"{infPath}\"");
+        _log.Info($"pnputil /add-driver → код {pnpCode}. {Shorten(pnpOut)}");
+        var storeInf = infPath;
+        var pub = Regex.Match(pnpOut, @"oem\d+\.inf", RegexOptions.IgnoreCase); // не зависит от языка вывода
+        if (pub.Success)
+            storeInf = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows),
+                "INF", pub.Value);
+
+        // 3. Регистрируем драйвер печати
+        var ok = TryAddPrinterDriver(model, storeInf) ||
+                 (storeInf != infPath && TryAddPrinterDriver(model, infPath));
+        if (!ok)
+        {
+            _log.Warn("Add-PrinterDriver не сработал — пробую printui /ia…");
+            var (iaCode, iaOut) = RunCommand("rundll32.exe",
+                $"printui.dll,PrintUIEntry /ia /m \"{model}\" /f \"{infPath}\"");
+            _log.Info($"printui /ia → код {iaCode}. {Shorten(iaOut)}");
+        }
+        if (!DriverInstalled(model))
+            return (false, $"Драйвер «{model}» не установился. Подробности в логе — отправьте его, разберусь.");
+        _log.Info($"Драйвер «{model}» установлен в системе.");
+
+        // 4. Создаём принтер
+        var (apCode, apOut) = RunCommand("powershell.exe",
+            "-NoProfile -NonInteractive -Command \"Add-Printer -Name '" + model.Replace("'", "''") +
+            "' -DriverName '" + model.Replace("'", "''") + "' -PortName '" + port.Replace("'", "''") + "'\"");
+        _log.Info($"Add-Printer → код {apCode}. {Shorten(apOut)}");
+
+        if (!ListPrinterRows().Any(r => r.Name.Equals(model, StringComparison.OrdinalIgnoreCase)))
+            return (false, $"Драйвер установлен, но принтер «{model}» не создался (порт {port}). " +
+                           "Подробности в логе — отправьте его.");
+
+        if (wasDefault) SetDefaultPrinter(model);
+        MarkTreatment(model, 4); // свежий драйвер: старые падения не считаем нерешёнными
+        _log.Info($"Готово: принтер «{model}» на порту {port}, драйвер переустановлен начисто.");
+        return (true, $"Драйвер переустановлен: принтер «{model}» создан на порту {port}.");
+    }
+
+    private bool TryAddPrinterDriver(string model, string infPath)
+    {
+        var (code, output) = RunCommand("powershell.exe",
+            "-NoProfile -NonInteractive -Command \"Add-PrinterDriver -Name '" + model.Replace("'", "''") +
+            "' -InfPath '" + infPath.Replace("'", "''") + "'\"");
+        _log.Info($"Add-PrinterDriver ({infPath}) → код {code}. {Shorten(output)}");
+        return code == 0 && DriverInstalled(model);
+    }
+
+    private bool DriverInstalled(string model)
+    {
+        try
+        {
+            using var searcher = new ManagementObjectSearcher("SELECT Name FROM Win32_PrinterDriver");
+            return searcher.Get().Cast<ManagementObject>()
+                .Any(d => ((string)d["Name"]).Split(',')[0]
+                    .Equals(model, StringComparison.OrdinalIgnoreCase));
+        }
+        catch { return false; }
+    }
+
+    private static (int Code, string Output) RunCommand(string file, string args)
+    {
+        var psi = new ProcessStartInfo(file, args)
+        {
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true
+        };
+        using var p = Process.Start(psi)!;
+        var output = p.StandardOutput.ReadToEnd() + p.StandardError.ReadToEnd();
+        p.WaitForExit(180000);
+        return (p.HasExited ? p.ExitCode : -1, output.Trim());
+    }
+
+    private static string Shorten(string s) =>
+        Regex.Replace(s, @"\s+", " ").Trim() is var t && t.Length > 400 ? t[..400] + "…" : t;
+
     private bool DeletePrinterDriver(string driverBaseName)
     {
         try
