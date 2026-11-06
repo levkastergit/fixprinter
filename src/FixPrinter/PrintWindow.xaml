@@ -6,7 +6,8 @@
         WindowStartupLocation="CenterOwner"
         Background="{StaticResource BgBrush}"
         FontFamily="Segoe UI"
-        AllowDrop="True" Drop="Window_Drop" DragOver="Window_DragOver">
+        x:Name="Root"
+        PreviewKeyDown="Window_PreviewKeyDown">
     <Grid Margin="20,16,20,16">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto"/>
@@ -20,7 +21,7 @@
             <TextBlock Text="Печать документов на принтер" FontSize="19" FontWeight="Bold"
                        Foreground="{StaticResource TextBrush}"/>
             <TextBlock Margin="0,3,0,0" FontSize="12" TextWrapping="Wrap" Foreground="{StaticResource MutedBrush}"
-                       Text="PDF и Word печатаются напрямую, в обход сбойного окна драйвера. Перетащите файлы в окно или нажмите «Добавить файлы»."/>
+                       Text="PDF и Word печатаются напрямую, в обход сбойного окна драйвера. Добавьте файлы: перетащите их в окно, или скопируйте в проводнике (Ctrl+C) и вставьте сюда (Ctrl+V), или нажмите «Добавить файлы»."/>
         </StackPanel>
 
         <!-- Основная область: файлы слева, предпросмотр справа -->
@@ -92,7 +93,12 @@
                     <TextBlock x:Name="PreviewHint" Text="Предпросмотр листов появится здесь"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                Foreground="{StaticResource MutedBrush}" FontSize="13"/>
-                    <ScrollViewer VerticalScrollBarVisibility="Auto">
+                    <ScrollViewer x:Name="PreviewScroll" Margin="0,28,0,0" VerticalScrollBarVisibility="Auto"
+                                  HorizontalScrollBarVisibility="Auto" Cursor="Hand" Background="Transparent"
+                                  PreviewMouseWheel="Preview_MouseWheel"
+                                  PreviewMouseLeftButtonDown="Preview_MouseDown"
+                                  PreviewMouseMove="Preview_MouseMove"
+                                  PreviewMouseLeftButtonUp="Preview_MouseUp">
                         <ItemsControl x:Name="PreviewList">
                             <ItemsControl.ItemsPanel>
                                 <ItemsPanelTemplate><WrapPanel/></ItemsPanelTemplate>
@@ -102,7 +108,9 @@
                                     <StackPanel Margin="8">
                                         <Border Background="White" CornerRadius="2" Padding="0"
                                                 BorderBrush="#334155" BorderThickness="1">
-                                            <Image Source="{Binding Image}" Width="150" Stretch="Uniform"/>
+                                            <Image Source="{Binding Image}" Stretch="Uniform"
+                                                   RenderOptions.BitmapScalingMode="HighQuality"
+                                                   Width="{Binding ThumbWidth, ElementName=Root}"/>
                                         </Border>
                                         <TextBlock Text="{Binding Caption}" FontSize="11" HorizontalAlignment="Center"
                                                    Margin="0,4,0,0" Foreground="{StaticResource MutedBrush}"/>
@@ -114,6 +122,31 @@
                     <TextBlock x:Name="PreviewBusy" Text="Готовлю предпросмотр…" Visibility="Collapsed"
                                HorizontalAlignment="Center" VerticalAlignment="Center"
                                Foreground="{StaticResource AccentBrush}" FontSize="13"/>
+
+                    <!-- Панель масштаба предпросмотра -->
+                    <Border HorizontalAlignment="Right" VerticalAlignment="Bottom" Margin="0,0,14,10"
+                            CornerRadius="9" Background="#E61E293B" BorderBrush="{StaticResource CardBorderBrush}"
+                            BorderThickness="1" Padding="4">
+                        <StackPanel Orientation="Horizontal">
+                            <Button Content="−" Width="30" Style="{StaticResource GhostButton}" Padding="0,3"
+                                    FontSize="15" Click="ZoomOut_Click" ToolTip="Уменьшить"/>
+                            <TextBlock x:Name="ZoomText" Text="100%" Width="52" TextAlignment="Center"
+                                       VerticalAlignment="Center" Foreground="{StaticResource TextBrush}" FontSize="12.5"/>
+                            <Button Content="+" Width="30" Style="{StaticResource GhostButton}" Padding="0,3"
+                                    FontSize="15" Click="ZoomIn_Click" ToolTip="Увеличить"/>
+                            <Button Content="По ширине" Margin="6,0,0,0" Style="{StaticResource GhostButton}"
+                                    Padding="10,3" FontSize="12" Click="ZoomFit_Click"
+                                    ToolTip="Один лист во всю ширину окна предпросмотра"/>
+                            <Button Content="Все листы" Margin="6,0,0,0" Style="{StaticResource GhostButton}"
+                                    Padding="10,3" FontSize="12" Click="ZoomReset_Click"
+                                    ToolTip="Вернуть мелкие миниатюры"/>
+                        </StackPanel>
+                    </Border>
+                    <Border HorizontalAlignment="Left" VerticalAlignment="Top" Margin="4,2,0,0" Padding="8,3"
+                            CornerRadius="7" Background="#CC1E293B" IsHitTestVisible="False">
+                        <TextBlock Text="🖱 Колёсико — масштаб · зажмите и тяните — прокрутка" FontSize="11"
+                                   Foreground="{StaticResource MutedBrush}"/>
+                    </Border>
                 </Grid>
             </Border>
         </Grid>
